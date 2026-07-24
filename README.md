@@ -1,12 +1,11 @@
 # Agentic SDLC
 
-Portable, governed software-delivery lifecycle tooling for Codex CLI, Claude
-Code, and runner-neutral automation.
+Governed software-delivery lifecycle tooling, runner-neutral by design.
 
-The installable plugin lives under [`plugins/agentic-sdlc`](plugins/agentic-sdlc).
+The portable kernel lives under [`plugins/agentic-sdlc`](plugins/agentic-sdlc).
 It owns the G1-G10 lifecycle contracts, project initializer, deterministic
-planner and validator, approval evidence adapters, and reusable skills.
-Projects own their `.agentic-sdlc/` overlays and records.
+planner and validator, and approval evidence adapters. Projects own their
+`.agentic-sdlc/` overlays and records.
 
 ```sh
 ./bin/agentic-sdlc --help
@@ -24,3 +23,17 @@ explicit, versioned provider manifest:
 
 See the [plugin guide](plugins/agentic-sdlc/README.md) for lifecycle operation,
 provider behavior, upgrades, and fail-closed defaults.
+
+## Orchestration: the LangGraph engine
+
+[`agentic_sdlc_langgraph/`](agentic_sdlc_langgraph) drives a task through the
+G1-G10 lifecycle as an actual compiled graph — author/reviewer dispatch, gate
+sequencing, separation-of-duties enforcement, and human/mutation-gate stops
+are graph control flow, not prose an LLM host has to interpret. It replaces
+the plugin's earlier skill-based orchestration — see that package's README
+for the `agentic-sdlc-lg` CLI and standalone service, and this repository's
+commit history for the phase-by-phase design rationale.
+
+```sh
+cd agentic_sdlc_langgraph && uv sync && uv run pytest
+```

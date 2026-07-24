@@ -1,53 +1,34 @@
 # Agentic SDLC plugin
 
-This plugin makes the repository's G1–G10 Agentic SDLC portable. It supplies a versioned lifecycle kernel, deterministic planning and validation tools, and skills packaged for both Codex CLI and Claude Code, while leaving project-specific authority and lifecycle state in the target repository. See [runner-adapters.md](contracts/runner-adapters.md) for exactly how each runner maps to skill invocation, human questions, and subagent dispatch.
+This plugin makes the repository's G1–G10 Agentic SDLC portable. It supplies a versioned lifecycle kernel — the G1–G10 gate contracts, mutation-gate definitions, run-record/agent-catalog/profile/provider JSON Schemas — plus a deterministic CLI (`scripts/agentic_sdlc.py`) for bootstrapping a target project's overlay, planning a task's dispatch, and validating lifecycle state, while leaving project-specific authority and lifecycle state in the target repository.
+
+Orchestrating actual work against this kernel — dispatching author/reviewer roles, stopping at human/mutation gates, tracking gate state across a task's lifetime — is done by the LangGraph engine in [`../../agentic_sdlc_langgraph/`](../../agentic_sdlc_langgraph), not by this plugin. See that package's README for the `agentic-sdlc-lg` CLI and the standalone service. (An earlier version of this plugin shipped that orchestration as six Claude Code/Codex CLI skills an LLM host had to interpret step by step; those were retired once the LangGraph engine replaced them with real, testable control flow.)
 
 The intended adoption path is:
 
 ```text
-Install plugin -> initialize target repository -> review detected overlay
--> assign human authorities and resolve applicability -> plan or orchestrate work
+Initialize target repository -> review detected overlay -> assign human
+authorities and resolve applicability -> plan or orchestrate work via
+agentic-sdlc-lg
 ```
 
 Initialization makes a project immediately usable for planning, artifact preparation, independent review, and validation. It does not make unresolved organizational decisions merely to produce a green result.
 
-## Install from the team marketplace
-
-Two equivalent marketplace manifests point at the same plugin: `.agents/plugins/marketplace.json` for Codex CLI and `.claude-plugin/marketplace.json` for Claude Code, both named `agents-team`. From this repository root, add the marketplace and install the plugin:
-
-Codex CLI:
-
-```sh
-codex plugin marketplace add .
-codex plugin add agentic-sdlc@agents-team
-```
-
-Claude Code:
-
-```text
-/plugin marketplace add .
-/plugin install agentic-sdlc@agents-team
-```
-
-If your team publishes this marketplace from a shared Git source, use that marketplace source instead of the local checkout. Installation exposes the bundled skills (and, once a target project is initialized, the generated subagent wrappers); it does not edit a target repository.
-
 ## Initialize a project
 
 The canonical command is the direct `agentic-sdlc` executable (or
-`plugins/agentic-sdlc/scripts/agentic_sdlc.py` during development). The former
-`agents sdlc ...` wrapper remains a temporary compatibility interface — see
-`../../README.md` "System-wide install"):
+`plugins/agentic-sdlc/scripts/agentic_sdlc.py` during development):
 
 ```sh
 agentic-sdlc init --root /path/to/target
 ```
 
-From an installed plugin, invoke the `initialize-agentic-sdlc` skill and identify the target repository. The skill detects candidate stack and command information, calls the initializer, preserves unknowns and unassigned authorities, and then runs validation. The CLI `init` command itself writes the overlay and reports blockers; run `validate` separately when using the CLI directly. Review generated files before using them as policy.
+The CLI `init` command detects candidate stack and command information, writes the project overlay, preserves unknowns and unassigned authorities, and reports blockers. Run `validate` separately afterward. Review generated files before using them as policy.
 
 Use `--help` for the exact options supported by the installed plugin version:
 
 ```sh
-agents sdlc init --help
+agentic-sdlc init --help
 ```
 
 ## Portable architecture
@@ -56,7 +37,7 @@ The distribution has three deliberately separate layers:
 
 | Layer | Owner | Contents |
 |---|---|---|
-| Portable kernel | Plugin maintainer | G1–G10 definitions, mutation-gate separation, schemas, lifecycle state, validation, and reusable skills. |
+| Portable kernel | Plugin maintainer | G1–G10 definitions, mutation-gate separation, schemas, lifecycle state, and validation. |
 | Project overlay | Target project | Technology and command detection, routing/profile choices, authority assignments, environment declarations, applicability decisions, and kernel version lock. |
 | Project state | Target project | Dispatch plans, run records, findings, exceptions, invalidations, evidence references, and human approval references. |
 
@@ -152,8 +133,8 @@ invalidate  Record a material change and invalidate the earliest affected gate a
 Always inspect command-specific help before scripting an interface:
 
 ```sh
-agents sdlc --help
-agents sdlc plan --help
+agentic-sdlc --help
+agentic-sdlc plan --help
 ```
 
 Task IDs are preserved exactly and must already use only letters, numbers, dots, underscores, and hyphens. The CLI rejects lossy normalization so distinct external IDs cannot share lifecycle state.
@@ -166,9 +147,9 @@ agentic-sdlc init --root /path/to/target --classification internal
 agentic-sdlc plan --root /path/to/target --task-id TEAM-DEMO-001 --task "Define requirements traceability for the order API"
 agentic-sdlc validate --root /path/to/target
 agentic-sdlc status --root /path/to/target --task-id TEAM-DEMO-001
-agents sdlc approve-from-github --root /path/to/target --task-id TEAM-DEMO-001 --gate G2 --role product_owner --repo example/service --pr 42 --review-id 314159 --reviewer-login octocat --commit-sha 0123abcd
-agents sdlc approve-from-github-pr --root /path/to/target --task-id TEAM-DEMO-001 --gate G2 --role product_owner --repo example/service --pr 42 --commit-sha 0123abcd
-agents sdlc invalidate --root /path/to/target --task-id TEAM-DEMO-001 --earliest-gate G2 --reason "Approved intent changed" --actor "product-owner"
+agentic-sdlc approve-from-github --root /path/to/target --task-id TEAM-DEMO-001 --gate G2 --role product_owner --repo example/service --pr 42 --review-id 314159 --reviewer-login octocat --commit-sha 0123abcd
+agentic-sdlc approve-from-github-pr --root /path/to/target --task-id TEAM-DEMO-001 --gate G2 --role product_owner --repo example/service --pr 42 --commit-sha 0123abcd
+agentic-sdlc invalidate --root /path/to/target --task-id TEAM-DEMO-001 --earliest-gate G2 --reason "Approved intent changed" --actor "product-owner"
 ```
 
 Projects that want GitHub PR reviews to be the authoritative human-approval source can opt in through `.agentic-sdlc/project.json`:
@@ -199,46 +180,19 @@ Initialization, detection, planning, status, and invalidation work with Python 3
 python3 -m pip install -r plugins/agentic-sdlc/requirements-validation.txt
 ```
 
-The plugin also exposes these skills, packaged for both Codex CLI and Claude Code:
-
-- `initialize-agentic-sdlc`
-- `orchestrate-agentic-sdlc`
-- `validate-agentic-sdlc`
-- `review-lifecycle-gate`
-- `invalidate-lifecycle-gates`
-- `runtime-assurance-status`
-
-Use a skill for the guided workflow and the command for deterministic generation, inspection, validation, and CI integration.
+This kernel CLI covers bootstrapping and bookkeeping (`init`/`detect`/`validate`/`status`/`invalidate`/`approve-from-github*`). For actually dispatching and driving a task through the G1–G10 lifecycle — author/reviewer dispatch, human/mutation-gate interrupts, invalidation with real re-execution — use the LangGraph engine's `agentic-sdlc-lg` CLI or service in [`../../agentic_sdlc_langgraph/`](../../agentic_sdlc_langgraph).
 
 ## Team demonstration
 
 Use a synthetic or non-production repository for the first demonstration:
 
-1. Install the plugin and initialize the repository.
+1. Initialize the repository (`agentic-sdlc init`).
 2. Show the generated unknown/unassigned values and explain why they fail closed.
 3. Use `detect` to review observable stack and command candidates.
 4. Use `plan` for an intent-and-requirements task and inspect the selected workflow, agents, `required_quality_gates`, and separate `human_gates`.
-5. Invoke `orchestrate-agentic-sdlc` in planning-review-only mode.
-6. Show that artifact authors, independent reviewers, and human approvers remain separate.
-7. Validate and display the project-owned run record.
-8. Change a material upstream assumption and demonstrate downstream invalidation without granting a new approval.
-
-A suitable prompt is (see [runner-adapters.md](contracts/runner-adapters.md) for the `$skill-name` vs `/skill-name` distinction):
-
-```text
-Use orchestrate-agentic-sdlc in planning-review-only mode.
-Task ID: TEAM-DEMO-001
-Objective: Define and review a small internal order-processing API.
-Prepare intent, traceable requirements, architecture, governance/data,
-security/crypto, test, and evidence obligations. Do not deploy or approve gates.
-```
-
-A basic prompt also works without a task ID, classification, or explicit mode —
-the skill derives them and asks only when something is genuinely ambiguous:
-
-```text
-Use orchestrate-agentic-sdlc to review whether the order-processing API is ready to ship.
-```
+5. From `../../agentic_sdlc_langgraph/`, run `agentic-sdlc-lg plan`/`resume` against the same task and show it suspending at each gate's human-approval interrupt and at any matched mutation-gate phrase, with author/reviewer separation enforced structurally rather than by convention.
+6. Validate and display the exported run record (`agentic-sdlc-lg export` / `validate`).
+7. Change a material upstream assumption and demonstrate downstream invalidation (`agentic-sdlc-lg invalidate` then `reenter`) without granting a new approval.
 
 ## Upgrades and version lock
 
@@ -246,7 +200,7 @@ The generated overlay records both the kernel and plugin versions it was created
 
 For an upgrade:
 
-1. Update or reinstall the plugin from the same marketplace.
+1. Update the plugin package to the new kernel version.
 2. Review release and schema changes before changing the project lock.
 3. Run `detect` and `validate` against the existing overlay and records.
 4. Review any generated overlay differences; do not overwrite local authority or applicability decisions without an accountable owner.

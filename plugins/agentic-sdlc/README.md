@@ -33,13 +33,13 @@ If your team publishes this marketplace from a shared Git source, use that marke
 
 ## Initialize a project
 
-The repository-hosted development command is (`bin/agents` at this repository's
-root resolves the interpreter and dispatches to `scripts/agentic_sdlc.py`;
-`agents sdlc ...` works from any directory once it's on `PATH` — see
+The canonical command is the direct `agentic-sdlc` executable (or
+`plugins/agentic-sdlc/scripts/agentic_sdlc.py` during development). The former
+`agents sdlc ...` wrapper remains a temporary compatibility interface — see
 `../../README.md` "System-wide install"):
 
 ```sh
-agents sdlc init --root /path/to/target
+agentic-sdlc init --root /path/to/target
 ```
 
 From an installed plugin, invoke the `initialize-agentic-sdlc` skill and identify the target repository. The skill detects candidate stack and command information, calls the initializer, preserves unknowns and unassigned authorities, and then runs validation. The CLI `init` command itself writes the overlay and reports blockers; run `validate` separately when using the CLI directly. Review generated files before using them as policy.
@@ -56,7 +56,7 @@ The distribution has three deliberately separate layers:
 
 | Layer | Owner | Contents |
 |---|---|---|
-| Portable kernel | Plugin maintainer | G1–G10 definitions, mutation-gate separation, schemas, agent catalog, selector/validator behavior, and reusable skills. |
+| Portable kernel | Plugin maintainer | G1–G10 definitions, mutation-gate separation, schemas, lifecycle state, validation, and reusable skills. |
 | Project overlay | Target project | Technology and command detection, routing/profile choices, authority assignments, environment declarations, applicability decisions, and kernel version lock. |
 | Project state | Target project | Dispatch plans, run records, findings, exceptions, invalidations, evidence references, and human approval references. |
 
@@ -100,9 +100,9 @@ These defaults allow work products to be prepared immediately while preventing a
 
 ## Profiles and extensions
 
-A profile supplies candidate routing, artifact, gate, and validation defaults for a recognizable project shape. The kernel includes `quick`, `generic`, and `web-service`; `--profile auto` proposes one from observable repository files, favoring `quick` absent a stronger signal. External providers may add domain profiles. A human reviews the result.
+A profile supplies provider-owned routing and contribution bindings. The kernel ships no profiles or agent catalog. Use kernel-only mode without `--profile`, or load an external provider such as `agentic-sdlc-defaults`.
 
-`quick` is the recommended starting point for "give it a task and let it orchestrate" use: a small agent set, and routes that carry no required G1-G10 lifecycle gate. `mutation-gates.json` is evaluated independently of profile, so production, destructive, persistent-migration, privileged-identity, and risk-acceptance requests still stop for human approval no matter which profile is active. `generic` and `web-service` are the heavier, opt-in profiles for teams that want the full lifecycle-gate ceremony from the start; see `agents/orchestration/quality-gates.md` in the source repository for what G1-G10 mean.
+Mutation gates are evaluated independently of providers, so production, destructive, persistent-migration, privileged-identity, and risk-acceptance requests still stop for human approval.
 
 The kernel ships no domain extensions. A provider contributes profiles, an
 agent catalog, and optional extensions through a versioned manifest:
@@ -111,10 +111,10 @@ agent catalog, and optional extensions through a versioned manifest:
 {
   "schema_version": 1,
   "id": "secure-cloud-agents",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "kernel_compatibility": {
-    "minimum": "0.2.0",
-    "maximum_exclusive": "0.3.0"
+    "minimum": "0.3.0",
+    "maximum_exclusive": "0.4.0"
   },
   "agent_catalog": "agent-catalog.json",
   "profile_roots": ["profiles"],
@@ -161,11 +161,11 @@ Task IDs are preserved exactly and must already use only letters, numbers, dots,
 Representative invocations are:
 
 ```sh
-agents sdlc detect --root /path/to/target
-agents sdlc init --root /path/to/target --profile auto --classification internal
-agents sdlc plan --root /path/to/target --task-id TEAM-DEMO-001 --task "Define requirements traceability for the order API"
-agents sdlc validate --root /path/to/target
-agents sdlc status --root /path/to/target --task-id TEAM-DEMO-001
+agentic-sdlc detect --root /path/to/target
+agentic-sdlc init --root /path/to/target --classification internal
+agentic-sdlc plan --root /path/to/target --task-id TEAM-DEMO-001 --task "Define requirements traceability for the order API"
+agentic-sdlc validate --root /path/to/target
+agentic-sdlc status --root /path/to/target --task-id TEAM-DEMO-001
 agents sdlc approve-from-github --root /path/to/target --task-id TEAM-DEMO-001 --gate G2 --role product_owner --repo example/service --pr 42 --review-id 314159 --reviewer-login octocat --commit-sha 0123abcd
 agents sdlc approve-from-github-pr --root /path/to/target --task-id TEAM-DEMO-001 --gate G2 --role product_owner --repo example/service --pr 42 --commit-sha 0123abcd
 agents sdlc invalidate --root /path/to/target --task-id TEAM-DEMO-001 --earliest-gate G2 --reason "Approved intent changed" --actor "product-owner"
@@ -265,4 +265,4 @@ Keep lifecycle state in version control according to the project's evidence-clas
 - Project-specific agent wrappers, knowledge-store integrations, CI wiring, and organization-specific impact extensions may require an overlay customization.
 - Specialized SQS/BOM semantics remain unavailable until an authorized owner supplies definitions and applicability.
 
-For the full lifecycle criteria and the source suite's operating model, see `agents/orchestration/quality-gates.md` and `agents/RUNBOOK.md` in this repository.
+Use `show-contract lifecycle-gates` for the normative lifecycle contract. Provider-specific operating guidance belongs to the provider package.

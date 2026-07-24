@@ -4,19 +4,26 @@ factory that wraps either one.
 
 Port of the "agent nodes get a factory" idea from the architecture plan
 (`make_agent_node(agent_id, kind, role_prompt, model_client)`), simplified
-slightly: the role prompt is derived from `agent_id`/`kind` inside the node
-rather than threaded through as a separate constructor argument, since this
-spike has no per-agent role-description text source beyond the catalog
-(agent-catalog.json only carries `kind`/`capabilities`, no prose role
-descriptions) — a real port of `agent_wrapper_body`'s role prompt text is
-future-phase work.
+slightly: the role prompt is derived from `agent_id`/`kind`/an agent's own
+catalog metadata/the active profile inside the node (via
+`resolve_role_prompt`, a Phase 2 port of `agent_wrapper_body` /
+`rich_agent_content` / `agent_wrapper_instructions`) rather than threaded
+through as a separate constructor argument. `resolve_role_prompt` supports
+both a provider-supplied rich role definition (`profile["rich_content_source"]`
++ an agent's `definition` file) and the generic templated instruction
+fallback used whenever no richer source is available or opted into --
+today, every shipped profile/catalog in this project uses the generic
+fallback (see `resolve_role_prompt`'s docstring).
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, TypedDict
+from pathlib import Path
+from typing import Any, Callable, Literal, Protocol, TypedDict
+
+from .provider import provider_resource
 
 
 class Identity(TypedDict):
@@ -62,13 +69,109 @@ class ModelClient(Protocol):
         ...
 
 
-def _default_role_prompt(agent_id: str, kind: str, gate_id: str) -> str:
+ASK_HUMAN_RULE = (
+    "You are a dispatched subagent: you cannot ask the human directly. If you reach a "
+    "decision only a human can make, stop and return a clearly labeled blocking question "
+    "in your result instead of guessing or proceeding."
+)
+
+RICH_CONTENT_ADAPTATION_NOTE = (
+    "Adapted from a role definition bundled with a provider's agent catalog. Review and "
+    "tailor this role for this project's own stack, policies, and gates before relying on "
+    "it -- shared-policy references in the source repository it came from will not resolve "
+    "here."
+)
+
+
+def _agent_wrapper_instructions(agent_id: str, reviewer: bool) -> str:
+    """Port of `agent_wrapper_instructions` (agentic_sdlc.py ~674-681):
+    the generic templated role instruction used whenever a richer,
+    provider-supplied role definition isn't available (or isn't opted
+    into by the profile)."""
     return (
-        f"You are the '{agent_id}' agent, acting as {kind} for lifecycle gate "
-        f"{gate_id} of the Agentic SDLC. Produce your contribution for the "
-        "task described by the user, and set blocking_question if you "
-        "cannot proceed without human clarification."
+        f"Act as the portable Agentic SDLC role {agent_id}. "
+        "Bind work to the task revision and lifecycle gate. "
+        "Never approve a lifecycle or mutation gate. "
+        + (
+            "Remain independent and do not modify the artifact under review."
+            if reviewer
+            else "Prepare artifacts for independent review; do not self-review."
+        )
+        + " "
+        + ASK_HUMAN_RULE
     )
+
+
+def _rich_agent_content(definition: Any, provider_root: str | Path | None) -> str | None:
+    """Port of `rich_agent_content` (agentic_sdlc.py ~700-705), extended
+    with path confinement (`provider_resource`) when a `provider_root` is
+    supplied. Returns `None` (triggering the generic-instruction
+    fallback) whenever `definition` is missing, escapes its provider
+    root, or doesn't resolve to a real file -- never raises."""
+    if not isinstance(definition, str) or not definition:
+        return None
+    if provider_root is not None:
+        try:
+            path = provider_resource(Path(provider_root), definition, "definition", directory=False)
+        except ValueError:
+            return None
+    else:
+        # No root supplied: trust `definition` only if it is already an
+        # absolute path (the expected shape once a provider has been
+        # loaded via `provider.load_provider`, which resolves and
+        # confines `definition` once, at load time -- see its
+        # docstring). A relative path with no root to confine against
+        # is treated as unresolved rather than resolved against cwd,
+        # which would be an implicit, unconfined escape hatch.
+        candidate = Path(definition)
+        if not candidate.is_absolute():
+            return None
+        path = candidate
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip()
+
+
+def resolve_role_prompt(
+    agent_id: str,
+    kind: Literal["author", "reviewer"],
+    metadata: dict[str, Any],
+    profile: dict[str, Any],
+    *,
+    provider_root: str | Path | None = None,
+) -> str:
+    """Port of `agent_wrapper_body` (agentic_sdlc.py ~708-713).
+
+    If `profile.get("rich_content_source")` is truthy and
+    `metadata.get("definition")` points to a real, path-confined file,
+    returns that file's stripped contents plus `RICH_CONTENT_ADAPTATION_NOTE`
+    plus `ASK_HUMAN_RULE`. Otherwise returns the generic templated
+    instruction (`_agent_wrapper_instructions`, which already ends in
+    `ASK_HUMAN_RULE`).
+
+    None of the three shipped profiles (`generic`/`quick`/`web-service`)
+    or the `agentic-sdlc-defaults` agent catalog set `rich_content_source`
+    or `definition` today, so in this project's real fixtures every agent
+    still gets the generic templated instruction -- this mechanism exists
+    for a future provider (e.g. `secure-cloud-agents`, which ships real
+    `AGENT.md` role definitions) to opt into.
+
+    Deviation from the task spec's literal 4-argument signature: an
+    optional keyword-only `provider_root` was added. Confinement ("a
+    definition can't escape its provider root") is meaningless without a
+    root to confine against. In production, `metadata["definition"]` is
+    already an absolute, pre-confined path by the time it reaches here --
+    `provider.load_provider` resolves and confines it once, at catalog-load
+    time (mirroring the legacy CLI's `load_agent_catalog()`) -- so
+    `provider_root` is normally omitted. It exists so this function can
+    also be unit-tested directly against a relative `definition` without
+    first going through the full provider loader.
+    """
+    if profile.get("rich_content_source"):
+        rich = _rich_agent_content(metadata.get("definition"), provider_root)
+        if rich is not None:
+            return "\n\n".join([rich, RICH_CONTENT_ADAPTATION_NOTE, ASK_HUMAN_RULE])
+    return _agent_wrapper_instructions(agent_id, kind == "reviewer")
 
 
 @dataclass
@@ -189,19 +292,37 @@ class AnthropicModelClient:
         )
 
 
-def make_agent_node(agent_id: str, kind: str, model_client: ModelClient) -> Callable[[dict], dict]:
+def make_agent_node(
+    agent_id: str,
+    kind: str,
+    model_client: ModelClient,
+    metadata: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
+    provider_root: str | Path | None = None,
+) -> Callable[[dict], dict]:
     """Build a LangGraph node function bound to one agent + dispatch role.
 
     The node reads `gate_id` and `task_text` off whatever payload the
     triggering `Send` carried (see graph.py's dispatch conditional edges)
     and returns a state update appending one `AgentOutput` dict to the
     `agent_outputs` map-reduce scratch field.
+
+    `metadata` (the agent's own agent-catalog entry, e.g.
+    `agent_catalog.get(agent_id, {})`) and `profile` (the active profile
+    dict) are threaded through to `resolve_role_prompt` so a
+    provider-supplied rich role definition is used when the profile opts
+    into it (`profile["rich_content_source"]`), falling back to the
+    generic templated instruction otherwise -- both default to `{}`,
+    which always takes the generic-instruction path, so existing callers
+    that don't pass them are unaffected.
     """
+    metadata = metadata or {}
+    profile = profile or {}
 
     def node(payload: dict[str, Any]) -> dict[str, Any]:
         gate_id = payload["gate_id"]
         task_text = payload.get("task_text", "")
-        role_prompt = _default_role_prompt(agent_id, kind, gate_id)
+        role_prompt = resolve_role_prompt(agent_id, kind, metadata, profile, provider_root=provider_root)
         output = model_client.complete(
             agent_id=agent_id,
             kind=kind,

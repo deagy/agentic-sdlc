@@ -130,11 +130,25 @@ def build_graph(
     model_client: ModelClient,
     checkpointer,
     mutation_gates: list[dict[str, Any]] | None = None,
+    profile: dict[str, Any] | None = None,
+    provider_root: str | None = None,
 ):
     """Build and compile the StateGraph for the given (already sliced)
-    gate list. See module docstring for the wiring rules."""
+    gate list. See module docstring for the wiring rules.
+
+    `profile` (the full active profile dict, e.g. from
+    `provider.merge_profile`) and `provider_root` are optional and are
+    threaded straight through to `make_agent_node`/`resolve_role_prompt`
+    so a provider that opts into rich role-definition content
+    (`profile["rich_content_source"]`) gets it; both default to `None`
+    (treated as "no rich content"), which reproduces this function's
+    prior generic-instruction-only behavior exactly, so existing callers
+    that only pass `gate_bindings`/`routes` (not the full profile) are
+    unaffected.
+    """
 
     mutation_gates = mutation_gates or []
+    profile = profile or {}
     gate_ids = [g["id"] for g in gates]
     gates_by_id = {g["id"]: g for g in gates}
 
@@ -223,7 +237,17 @@ def build_graph(
 
         for agent_id in author_ids:
             node_name = f"{gate_id}_author_{agent_id}"
-            builder.add_node(node_name, make_agent_node(agent_id, "author", model_client))
+            builder.add_node(
+                node_name,
+                make_agent_node(
+                    agent_id,
+                    "author",
+                    model_client,
+                    metadata=agent_catalog.get(agent_id, {}),
+                    profile=profile,
+                    provider_root=provider_root,
+                ),
+            )
             builder.add_edge(node_name, f"dispatch_reviewers_{gate_id}")
 
         # dispatch_reviewers_{gate_id}: passthrough node + conditional Send fan-out
@@ -266,7 +290,17 @@ def build_graph(
 
         for agent_id in possible_reviewer_ids:
             node_name = f"{gate_id}_reviewer_{agent_id}"
-            builder.add_node(node_name, make_agent_node(agent_id, "reviewer", model_client))
+            builder.add_node(
+                node_name,
+                make_agent_node(
+                    agent_id,
+                    "reviewer",
+                    model_client,
+                    metadata=agent_catalog.get(agent_id, {}),
+                    profile=profile,
+                    provider_root=provider_root,
+                ),
+            )
             builder.add_edge(node_name, f"gate_decision_{gate_id}")
 
         # gate_decision_{gate_id}: pure merge + separation-of-duties enforcement

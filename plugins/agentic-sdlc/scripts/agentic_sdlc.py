@@ -16,16 +16,20 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CONTRACTS = PLUGIN_ROOT / "contracts"
 PROFILES = PLUGIN_ROOT / "profiles"
 EXTENSIONS = PLUGIN_ROOT / "extensions"
-PROFILE_SEARCH_PATH = [PROFILES]
-EXTENSIONS_SEARCH_PATH = [EXTENSIONS]
-AGENT_CATALOG_SEARCH_PATH = [CONTRACTS / "agent-catalog.json"]
+PROFILE_SEARCH_PATH: list[Path] = []
+EXTENSIONS_SEARCH_PATH: list[Path] = []
+AGENT_CATALOG_SEARCH_PATH: list[Path] = []
 LOADED_PROVIDERS: list[dict[str, Any]] = []
 OVERLAY = ".agentic-sdlc"
+def lifecycle_contract() -> dict[str, Any]:
+    return load_json(CONTRACTS / "lifecycle-gates.json")
+
+
 GATE_IDS = [f"G{number}" for number in range(1, 11)]
 REQUIRED_AUTHORITY_ROLES = {
     "product_owner": ["G1", "G2", "G6"],
@@ -122,6 +126,10 @@ def load_provider(manifest_path: str) -> None:
     manifest = load_json(path)
     if manifest.get("schema_version") != 1:
         raise ValueError(f"unsupported provider schema in {path}")
+    allowed_manifest_keys = {"schema_version", "id", "version", "kernel_compatibility", "agent_catalog", "profile_roots", "extension_roots", "dependencies", "dispatch_bindings"}
+    unknown_manifest_keys = set(manifest) - allowed_manifest_keys
+    if unknown_manifest_keys:
+        raise ValueError(f"provider manifest contains unknown fields: {sorted(unknown_manifest_keys)}")
     provider_id = manifest.get("id")
     provider_version = manifest.get("version")
     if not isinstance(provider_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", provider_id):
@@ -135,10 +143,30 @@ def load_provider(manifest_path: str) -> None:
     minimum = semver_tuple(str(compatibility.get("minimum")))
     maximum = semver_tuple(str(compatibility.get("maximum_exclusive")))
     if not minimum <= semver_tuple(VERSION) < maximum:
-        raise ValueError(f"provider {provider_id} {provider_version} is incompatible with kernel {VERSION}")
+        raise ValueError(f"provider {provider_id} version {provider_version} is incompatible with kernel {VERSION}; install a provider compatible with 0.3.x")
+    for dependency in manifest.get("dependencies", []):
+        if not isinstance(dependency, dict) or not isinstance(dependency.get("id"), str):
+            raise ValueError(f"provider {provider_id} has malformed dependency metadata")
+        if dependency["id"] not in {item["id"] for item in LOADED_PROVIDERS}:
+            raise ValueError(f"provider {provider_id} requires provider {dependency['id']} to be loaded first")
 
     root = path.parent
     catalog = provider_resource(root, manifest.get("agent_catalog"), "agent_catalog", directory=False)
+    catalog_data = load_json(catalog)
+    if catalog_data.get("schema_version") != 1 or not isinstance(catalog_data.get("agents"), dict):
+        raise ValueError(f"provider {provider_id} agent catalog must contain an agents object")
+    valid_kinds = {"author", "reviewer", "specialist"}
+    valid_capabilities = {"author", "reviewer", "dispatch"}
+    for agent_id, agent in catalog_data["agents"].items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(agent_id)) or not isinstance(agent, dict):
+            raise ValueError(f"provider {provider_id} has an invalid agent id: {agent_id}")
+        if agent.get("kind") not in valid_kinds:
+            raise ValueError(f"provider {provider_id} agent {agent_id} has unknown kind")
+        capabilities = agent.get("capabilities", [])
+        if not isinstance(capabilities, list) or set(capabilities) - valid_capabilities:
+            raise ValueError(f"provider {provider_id} agent {agent_id} has unknown capabilities")
+        if agent.get("kind") == "reviewer" and set(capabilities) - {"reviewer"}:
+            raise ValueError(f"provider {provider_id} reviewer {agent_id} must remain read-only")
     profile_roots = [
         provider_resource(root, item, "profile_roots", directory=True)
         for item in manifest.get("profile_roots", [])
@@ -170,6 +198,22 @@ def load_provider(manifest_path: str) -> None:
     duplicate_extensions = existing_extensions.intersection(supplied_extensions)
     if duplicate_extensions:
         raise ValueError(f"provider {provider_id} duplicates extension ids: {sorted(duplicate_extensions)}")
+    for profile_root in profile_roots:
+        for profile_dir in profile_root.iterdir():
+            profile_path = profile_dir / "profile.json"
+            if not profile_path.is_file():
+                continue
+            profile = load_json(profile_path)
+            if profile.get("id") != profile_dir.name or not isinstance(profile.get("version"), str) or not isinstance(profile.get("gate_bindings"), dict):
+                raise ValueError(f"provider {provider_id} has malformed profile: {profile_path}")
+    for extension_root in extension_roots:
+        for extension_dir in extension_root.iterdir():
+            extension_path = extension_dir / "extension.json"
+            if not extension_path.is_file():
+                continue
+            extension = load_json(extension_path)
+            if extension.get("schema_version") != 1 or extension.get("id") != extension_dir.name or not isinstance(extension.get("version"), str):
+                raise ValueError(f"provider {provider_id} has malformed extension: {extension_path}")
 
     PROFILE_SEARCH_PATH.extend(profile_roots)
     EXTENSIONS_SEARCH_PATH.extend(extension_roots)
@@ -180,6 +224,8 @@ def load_provider(manifest_path: str) -> None:
             "id": provider_id,
             "version": ".".join(str(part) for part in version),
             "manifest_sha256": f"sha256:{digest}",
+            "catalog_sha256": fingerprint(catalog_data),
+            "dependencies": manifest.get("dependencies", []),
         }
     )
 
@@ -258,27 +304,27 @@ def select_github_review(
 ) -> dict[str, Any]:
     normalized_login = reviewer_login.lower()
     normalized_commit = normalize_commit_sha(commit_sha)
-    approved: list[dict[str, Any]] = []
+    matching: list[dict[str, Any]] = []
     for review in reviews:
         user = review.get("user")
         login = user.get("login") if isinstance(user, dict) else None
-        state = review.get("state")
         submitted_at = review.get("submitted_at")
         review_commit = normalize_commit_sha(review.get("commit_id"))
         if not isinstance(login, str) or login.lower() != normalized_login:
-            continue
-        if state != "APPROVED":
             continue
         if not is_valid_datetime(submitted_at):
             continue
         if normalized_commit and review_commit != normalized_commit:
             continue
-        approved.append(review)
-    if not approved:
+        matching.append(review)
+    if not matching:
         commit_text = f" at commit {commit_sha}" if commit_sha else ""
-        raise ValueError(f"no approved GitHub review found for reviewer {reviewer_login}{commit_text}")
-    approved.sort(key=lambda review: str(review.get("submitted_at")))
-    return approved[-1]
+        raise ValueError(f"no GitHub review found for reviewer {reviewer_login}{commit_text}")
+    matching.sort(key=lambda review: str(review.get("submitted_at")))
+    latest = matching[-1]
+    if latest.get("state") != "APPROVED" or latest.get("dismissed_state") in {"DISMISSED", "dismissed"}:
+        raise ValueError(f"latest GitHub review for reviewer {reviewer_login} is not an effective approval")
+    return latest
 
 
 def human_requirement_for_gate(gate: dict[str, Any], authority_id: str) -> dict[str, Any] | None:
@@ -529,15 +575,53 @@ def merge_profile(profile_id: str) -> dict[str, Any]:
         raise ValueError(f"duplicate profile: {profile_id}")
     path = candidates[0]
     child = load_json(path)
+    if child.get("id") != profile_id or not isinstance(child.get("version"), str):
+        raise ValueError(f"profile {profile_id} has malformed metadata; id and version are required")
+    if not isinstance(child.get("gate_bindings"), dict):
+        raise ValueError(f"profile {profile_id} must define gate_bindings")
     parent_id = child.get("extends")
     if not parent_id:
-        return child
-    parent = merge_profile(str(parent_id))
-    result = dict(parent)
-    result.update({key: value for key, value in child.items() if key not in {"agents", "routing"}})
-    result["agents"] = unique(list(parent.get("agents", [])) + list(child.get("agents", [])))
-    result["routing"] = list(parent.get("routing", [])) + list(child.get("routing", []))
+        result = child
+    else:
+        parent = merge_profile(str(parent_id))
+        result = dict(parent)
+        result.update({key: value for key, value in child.items() if key not in {"agents", "routing", "gate_bindings"}})
+        result["agents"] = unique(list(parent.get("agents", [])) + list(child.get("agents", [])))
+        result["routing"] = list(parent.get("routing", [])) + list(child.get("routing", []))
+        merged_bindings = dict(parent.get("gate_bindings", {}))
+        for gate_id, binding in child.get("gate_bindings", {}).items():
+            merged_bindings[gate_id] = binding
+        result["gate_bindings"] = merged_bindings
     result["id"] = profile_id
+    result.setdefault("gate_bindings", {})
+    known_gates = set(GATE_IDS)
+    unknown_gates = set(result["gate_bindings"]) - known_gates
+    if unknown_gates:
+        raise ValueError(f"profile {profile_id} references unknown lifecycle gates: {sorted(unknown_gates)}")
+    known_slots = {slot for gate in lifecycle_contract()["gates"] for slot in gate.get("required_contributions", [])}
+    for binding in result["gate_bindings"].values():
+        if not isinstance(binding, dict) or not isinstance(binding.get("contributions"), dict):
+            raise ValueError(f"profile {profile_id} has malformed gate contribution binding")
+        unknown_slots = set(binding.get("contributions", {})) - known_slots
+        if unknown_slots:
+            raise ValueError(f"profile {profile_id} references unknown contribution slots: {sorted(unknown_slots)}")
+        known_agents = set(load_agent_catalog())
+        for contribution in binding.get("contributions", {}).values():
+            if not isinstance(contribution, dict) or any(not isinstance(contribution.get(field), list) for field in ("agents", "tasks", "artifacts")):
+                raise ValueError(f"profile {profile_id} has malformed contribution metadata")
+        unknown_agents = {agent for contribution in binding.get("contributions", {}).values() for agent in contribution.get("agents", [])} - known_agents
+        if unknown_agents:
+            raise ValueError(f"profile {profile_id} references unknown agents: {sorted(unknown_agents)}")
+    result["agents"] = unique(list(result.get("agents", [])) + [
+        agent for binding in result["gate_bindings"].values()
+        for contribution in binding.get("contributions", {}).values()
+        for agent in contribution.get("agents", [])
+    ])
+    for route in result.get("routing", []):
+        referenced = set(route.get("agents", [])) | set(route.get("reviewers", [])) | set(route.get("support", []))
+        unknown = referenced - set(load_agent_catalog())
+        if unknown:
+            raise ValueError(f"profile {profile_id} route {route.get('id')} references unknown agents: {sorted(unknown)}")
     return result
 
 
@@ -605,7 +689,10 @@ def load_agent_catalog() -> dict[str, Any]:
             for metadata in catalog.values():
                 definition = metadata.get("definition")
                 if isinstance(definition, str) and not Path(definition).is_absolute():
-                    metadata["definition"] = str((path.parent / definition).resolve())
+                    resolved_definition = (path.parent / definition).resolve()
+                    if not resolved_definition.is_relative_to(path.parent.resolve()):
+                        raise ValueError(f"agent definition escapes provider root: {definition}")
+                    metadata["definition"] = str(resolved_definition)
             merged.update(catalog)
     return merged
 
@@ -640,7 +727,7 @@ def write_codex_agent_wrappers(root: Path, profile: dict[str, Any], catalog: dic
         reviewer = metadata["kind"] == "reviewer"
         content = "\n".join([
             f"name = {toml_string(agent_id)}",
-            f"description = {toml_string('Portable Agentic SDLC ' + metadata['kind'] + ' for ' + metadata['phase'])}",
+            f"description = {toml_string('Portable Agentic SDLC ' + metadata.get('kind', 'specialist') + ' for ' + metadata.get('phase', 'lifecycle'))}",
             f"sandbox_mode = {toml_string('read-only' if reviewer else 'workspace-write')}",
             f"developer_instructions = {toml_string(agent_wrapper_body(agent_id, reviewer, metadata, profile))}",
             "",
@@ -662,7 +749,7 @@ def write_claude_agent_wrappers(root: Path, profile: dict[str, Any], catalog: di
         if target.exists():
             continue
         reviewer = metadata["kind"] == "reviewer"
-        description = "Portable Agentic SDLC " + metadata["kind"] + " for " + metadata["phase"]
+        description = "Portable Agentic SDLC " + metadata.get("kind", "specialist") + " for " + metadata.get("phase", "lifecycle")
         frontmatter = "\n".join([
             "---",
             f"name: {agent_id}",
@@ -702,8 +789,8 @@ def initialize(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     detected = detect_repository(root)
-    profile_id = detected["proposed_profile"] if args.profile == "auto" else args.profile
-    profile = merge_profile(profile_id)
+    profile_id = None if args.profile in {None, "kernel-only"} else (detected["proposed_profile"] if args.profile == "auto" else args.profile)
+    profile = merge_profile(profile_id) if profile_id else {"id": "kernel-only", "routing": [], "ignored_gates": [], "gate_bindings": [], "impact_categories": []}
     extension_ids = unique(args.extension or [])
     impact = [impact_item(item_id, "generic-software") for item_id in profile.get("impact_categories", [])]
     specialized_boms: list[dict[str, Any]] = []
@@ -715,6 +802,8 @@ def initialize(args: argparse.Namespace) -> int:
         if extension_path is None:
             raise ValueError(f"unknown extension: {extension_id}")
         extension = load_json(extension_path)
+        if extension.get("schema_version") != 1 or extension.get("id") != extension_id or not isinstance(extension.get("version"), str):
+            raise ValueError(f"extension {extension_id} has malformed metadata")
         impact.extend(impact_item(item_id, extension_id) for item_id in extension.get("impact_categories", []))
         specialized_boms.extend(impact_item(bom, extension_id) for bom in extension.get("specialized_boms", []))
     overlay = confined_path(root, OVERLAY)
@@ -725,6 +814,7 @@ def initialize(args: argparse.Namespace) -> int:
         "project_id": args.project_id or root.name,
         "classification": args.classification,
         "profile": profile_id,
+        "profile_digest": fingerprint(profile),
         "extensions": extension_ids,
         "providers": [item["id"] for item in LOADED_PROVIDERS],
         "approval_sources": {
@@ -752,20 +842,25 @@ def initialize(args: argparse.Namespace) -> int:
         "routes": profile.get("routing", []),
         "change_intake": profile.get("change_intake", {}),
         "ignored_gates": profile.get("ignored_gates", []),
+        "gate_bindings": profile.get("gate_bindings", {}),
     }
     commands = {"version": 1, "commands": detected["command_candidates"], "confirmed": False}
     created = []
     for name, value in [("project.json", project), ("authorities.json", authorities), ("impact-profile.json", impact_profile), ("routing.json", routing), ("commands.json", commands)]:
-        if write_json(overlay / name, value, overwrite=args.force):
+        if write_json(overlay / name, value, overwrite=False):
             created.append(f"{OVERLAY}/{name}")
     lock = overlay / "version.lock"
-    if args.force or not lock.exists():
+    if not lock.exists():
         lock.write_text(
             json.dumps(
                 {
                     "plugin_version": VERSION,
                     "kernel_version": VERSION,
-                    "contracts": 1,
+                    "contracts": 2,
+                    "contract_digest": fingerprint(lifecycle_contract()),
+                    "profile": profile_id,
+                    "profile_digest": fingerprint(profile),
+                    "dispatch_binding_digest": fingerprint(routing.get("gate_bindings", {})),
                     "providers": LOADED_PROVIDERS,
                 },
                 indent=2,
@@ -775,7 +870,7 @@ def initialize(args: argparse.Namespace) -> int:
         )
         created.append(f"{OVERLAY}/version.lock")
     update_agents_md(root)
-    wrappers = write_agent_wrappers(root, profile, args.runner)
+    wrappers = write_agent_wrappers(root, profile, args.runner) if profile_id else []
     print(json.dumps({"status": "initialized", "root": str(root), "profile": profile_id, "created": created, "agent_wrappers_created": wrappers, "ready": False, "blockers": ["Human authorities and impact applicability require explicit decisions."]}, indent=2))
     return 0
 
@@ -817,12 +912,21 @@ def lifecycle_sequence(gate_ids: list[str], ignored_gates: list[str]) -> tuple[l
     return sequence, ignored
 
 
+def gate_dispatch_binding(gate: dict[str, Any], routing: dict[str, Any]) -> dict[str, list[str]]:
+    result = {"agents": [], "tasks": [], "artifacts": []}
+    binding = routing.get("gate_bindings", {}).get(gate["id"], {})
+    contributions = binding.get("contributions", {}) if isinstance(binding, dict) else {}
+    for slot in gate.get("required_contributions", []):
+        contribution = contributions.get(slot)
+        if not isinstance(contribution, dict):
+            continue
+        for field in result:
+            result[field].extend(contribution.get(field, []))
+    return {field: unique(values) for field, values in result.items()}
+
+
 def gate_agent_artifacts(gate: dict[str, Any]) -> list[dict[str, str]]:
-    agents = [*gate.get("author_agents", []), *gate.get("review_agents", ["code-reviewer"])]
-    return [
-        {"agent_id": agent, "artifact_id": f"{gate['id'].lower()}-{agent}-attestation"}
-        for agent in unique(agents)
-    ]
+    return []
 
 
 def make_gate_record(
@@ -830,27 +934,11 @@ def make_gate_record(
 ) -> dict[str, Any]:
     affected_unknown = bool(impact.get("blocking_unknowns")) and gate["id"] in {"G3", "G4", "G5", "G7"}
     authority_requirements = []
-    for reviewer in gate.get("review_agents", ["code-reviewer"]):
-        authority_requirements.append({"authority_id": reviewer, "authority_type": "independent-verifier", "role": reviewer, "applicability": "applicable", "rationale": "Required by lifecycle gate contract"})
-    for authority_id in gate.get("human_authorities", []):
+    for authority_id in gate.get("authority_requirements", []):
+        if authority_id not in AUTHORITY_ROLES:
+            continue
         assigned = authorities.get(authority_id, {}).get("status") == "assigned"
         authority_requirements.append({"authority_id": authority_id, "authority_type": "human-approver", "role": ROLE_LABELS[authority_id], "applicability": "applicable" if assigned else "unknown", "rationale": "Assigned in project authority map" if assigned else "Authority is not assigned"})
-    for authority_id in gate.get("conditional_human_authorities", []):
-        authority = authorities.get(authority_id, {})
-        applicability = authority.get("applicability", "unknown")
-        if applicability == "applicable" and authority.get("status") != "assigned":
-            applicability = "unknown"
-        authority_requirements.append({
-            "authority_id": authority_id,
-            "authority_type": "human-approver",
-            "role": ROLE_LABELS[authority_id],
-            "applicability": applicability,
-            "rationale": authority.get("rationale") or (
-                "Assigned and applicable in project authority map"
-                if applicability == "applicable"
-                else "Applicability requires an accountable project decision"
-            ),
-        })
     return {
         "tier": "lifecycle",
         "gate_id": gate["id"],
@@ -889,6 +977,8 @@ def plan_task(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     overlay, project, authorities, impact, routing = load_overlay(root)
     workflow, matched = choose_workflow(args.task, routing.get("routes", []))
+    if not LOADED_PROVIDERS and workflow != "needs-triage":
+        raise ValueError("agent dispatch requires a loaded provider; rerun with --provider <manifest>, or use a kernel-only lifecycle operation")
     primary: list[str] = []
     reviewers: list[str] = []
     support: list[str] = []
@@ -914,8 +1004,6 @@ def plan_task(args: argparse.Namespace) -> int:
     sequence, ignored_gates = lifecycle_sequence(gates, configured_ignored)
     gates = [gate_id for gate_id in sequence if gate_id not in ignored_gates]
     reviewers = [agent for agent in reviewers if agent not in primary]
-    if workflow == "needs-triage":
-        support = unique(support + ["requirements-agent"])
     if workflow == "production-release":
         support = unique(support + ["release-engineer"])
         gates = unique(gates + ["G8", "G9"])
@@ -942,21 +1030,17 @@ def plan_task(args: argparse.Namespace) -> int:
             "contributing_routes": contributing_routes,
         })
     gate_contracts = {gate["id"]: gate for gate in lifecycle}
-    gate_agents = [
-        agent
-        for gate_id in sequence
-        if gate_id not in ignored_gates
-        for agent in [*gate_contracts[gate_id].get("author_agents", []), *gate_contracts[gate_id].get("review_agents", ["code-reviewer"])]
-    ]
+    gate_bindings = {gate_id: gate_dispatch_binding(gate_contracts[gate_id], routing) for gate_id in sequence}
+    gate_agents = [agent for gate_id in sequence if gate_id not in ignored_gates for agent in gate_bindings[gate_id]["agents"]]
     support = unique(support + gate_agents)
     support = [agent for agent in support if agent not in primary and agent not in reviewers]
     gate_dispatch = [
         {
             "gate_id": gate_id,
             "status": "ignored" if gate_id in ignored_gates else "required",
-            "agents": unique([*gate_contracts[gate_id].get("author_agents", []), *gate_contracts[gate_id].get("review_agents", ["code-reviewer"])]),
-            "tasks": gate_contracts[gate_id].get("tasks", []),
-            "artifacts": gate_contracts[gate_id].get("artifacts", []),
+            "agents": gate_bindings[gate_id]["agents"],
+            "tasks": gate_bindings[gate_id]["tasks"],
+            "artifacts": gate_bindings[gate_id]["artifacts"],
         }
         for gate_id in sequence
     ]
@@ -989,6 +1073,12 @@ def plan_task(args: argparse.Namespace) -> int:
         "baseline_revision": "unresolved",
         "scope": args.task,
         "dispatch_fingerprint": dispatch_hash,
+        "kernel_version": VERSION,
+        "contract_digest": fingerprint(lifecycle_contract()),
+        "provider_bindings": LOADED_PROVIDERS,
+        "profile": project.get("profile"),
+        "profile_digest": project.get("profile_digest"),
+        "dispatch_binding_digest": fingerprint(routing.get("gate_bindings", {})),
         "disposition": "pending",
         "intent_record_id": None,
         "requirements_baseline_id": None,
@@ -1004,9 +1094,9 @@ def plan_task(args: argparse.Namespace) -> int:
                     "configured": gate_id in sequence,
                     "ignored": gate_id in ignored_gates,
                     "ignore_reason": "Configured in project routing" if gate_id in ignored_gates else None,
-                    "required_agents": gate_contracts[gate_id].get("author_agents", []) + gate_contracts[gate_id].get("review_agents", ["code-reviewer"]),
+                    "required_agents": gate_bindings.get(gate_id, {"agents": []})["agents"],
                     "dispatched_agents": [],
-                    "required_tasks": gate_contracts[gate_id].get("tasks", []),
+                    "required_tasks": gate_bindings.get(gate_id, {"tasks": []})["tasks"],
                     "completed_tasks": [],
                     "required_agent_artifacts": gate_agent_artifacts(gate_contracts[gate_id]),
                     "produced_agent_artifacts": [],
@@ -1032,9 +1122,38 @@ def plan_task(args: argparse.Namespace) -> int:
             raise ValueError(f"task ID {task_id} has an existing run record for different task or routing state; use a new task ID")
     write_json(dispatch_path, dispatch)
     if not record_path.exists():
+        advance_lifecycle(record, routing)
         write_json(record_path, record)
     print(json.dumps(dispatch, indent=2))
     return 0
+
+
+def advance_lifecycle(record: dict[str, Any], routing: dict[str, Any]) -> dict[str, Any]:
+    """Move only the next eligible gate to ready; never infer approval."""
+    contracts = {item["id"]: item for item in lifecycle_contract()["gates"]}
+    gates = record.get("lifecycle_gates", [])
+    for index, gate in enumerate(gates):
+        if gate.get("applicability") == "not-applicable" or gate.get("status") in {"approved", "invalidated"}:
+            continue
+        if gate.get("status") not in {"pending", "blocked"}:
+            continue
+        contract = contracts.get(gate.get("gate_id"), {})
+        prerequisites = contract.get("prerequisites", [])
+        prior = {item.get("gate_id"): item for item in gates}
+        if any(prior.get(req, {}).get("status") != "approved" for req in prerequisites):
+            continue
+        if gate.get("applicability") != "applicable":
+            continue
+        if any(req.get("applicability") == "unknown" for req in gate.get("authority_requirements", [])):
+            continue
+        binding = gate_dispatch_binding(contract, routing)
+        required_fields = ["tasks", "artifacts"] if contract.get("human_only") else ["agents", "tasks", "artifacts"]
+        if contract.get("required_contributions") and not all(binding[field] for field in required_fields):
+            continue
+        gate["status"] = "ready"
+        break
+    record["current_lifecycle_phase"] = derive_current_phase(record)
+    return record
 
 
 def valid_exception(exception: dict[str, Any]) -> bool:
@@ -1160,7 +1279,7 @@ def validate_repository(args: argparse.Namespace) -> int:
         except (OSError, ValueError, json.JSONDecodeError) as error:
             errors.append(str(error))
             continue
-        required_top = {"version", "task_id", "dispatch_fingerprint", "recorded_at", "classification", "mode", "baseline_revision", "scope", "disposition", "intent_record_id", "requirements_baseline_id", "current_lifecycle_phase", "knowledge_retrieval", "impact_profile", "lifecycle_gates", "specialist_attestations", "re_entry_history"}
+        required_top = {"version", "task_id", "dispatch_fingerprint", "recorded_at", "classification", "mode", "baseline_revision", "scope", "disposition", "intent_record_id", "requirements_baseline_id", "current_lifecycle_phase", "knowledge_retrieval", "impact_profile", "lifecycle_gates", "specialist_attestations", "re_entry_history", "kernel_version", "contract_digest", "provider_bindings", "profile", "profile_digest", "dispatch_binding_digest"}
         missing_top = required_top.difference(record)
         if missing_top:
             errors.append(f"{record_path}: missing required fields: {sorted(missing_top)}")
@@ -1203,11 +1322,12 @@ def validate_repository(args: argparse.Namespace) -> int:
                     errors.append(f"{record_path}: {gate_id} execution configuration does not match dispatch plan")
                 if execution.get("ignored") != (gate_id in ignored_gate_ids):
                     errors.append(f"{record_path}: {gate_id} ignore state does not match dispatch plan")
-                expected_agents = unique(contract.get("author_agents", []) + contract.get("review_agents", ["code-reviewer"]))
+                binding = gate_dispatch_binding(contract, routing)
+                expected_agents = binding["agents"]
                 expected_artifacts = gate_agent_artifacts(contract)
-                if execution.get("required_agents") != expected_agents:
+                if execution.get("configured") and execution.get("required_agents") != expected_agents:
                     errors.append(f"{record_path}: {gate_id} required agent set does not match lifecycle contract")
-                if execution.get("required_tasks") != contract.get("tasks", []):
+                if execution.get("configured") and execution.get("required_tasks") != binding["tasks"]:
                     errors.append(f"{record_path}: {gate_id} required task set does not match lifecycle contract")
                 if execution.get("required_agent_artifacts") != expected_artifacts:
                     errors.append(f"{record_path}: {gate_id} required agent artifacts do not match lifecycle contract")
@@ -1216,7 +1336,7 @@ def validate_repository(args: argparse.Namespace) -> int:
                 if gate.get("status") in {"ready", "approved"} and execution.get("configured") and not execution.get("ignored"):
                     if set(execution.get("dispatched_agents", [])) != set(expected_agents):
                         errors.append(f"{record_path}: {gate_id} advanced without dispatching every configured agent")
-                    if set(execution.get("completed_tasks", [])) != set(contract.get("tasks", [])):
+                    if set(execution.get("completed_tasks", [])) != set(binding["tasks"]):
                         errors.append(f"{record_path}: {gate_id} advanced without completing every configured task")
                     produced = {
                         (item.get("agent_id"), item.get("artifact_id"))
@@ -1289,10 +1409,7 @@ def validate_repository(args: argparse.Namespace) -> int:
                     if requirement.get("applicability") == "not-applicable" and not requirement.get("rationale"):
                         errors.append(f"{record_path}: {gate_id} not-applicable authority {authority_id} lacks rationale")
                 gate_contract = gate_contracts.get(gate_id, {})
-                expected_reviewers = gate_contract.get("review_agents", ["code-reviewer"])
-                expected_requirement_ids = set(expected_reviewers)
-                expected_requirement_ids.update(gate_contract.get("human_authorities", []))
-                expected_requirement_ids.update(gate_contract.get("conditional_human_authorities", []))
+                expected_requirement_ids = set(gate_contract.get("authority_requirements", []))
                 missing_requirements = expected_requirement_ids - requirement_ids
                 if missing_requirements:
                     errors.append(
@@ -1303,7 +1420,7 @@ def validate_repository(args: argparse.Namespace) -> int:
                     errors.append(f"{record_path}: {gate_id} approved with unresolved authority applicability")
                 if not isinstance(verifier, dict) or not gate.get("independence_declaration", {}).get("verifier_confirmed_not_preparer"):
                     errors.append(f"{record_path}: {gate_id} lacks an independent verifier declaration")
-                required_reviewers = set(gate_contracts.get(gate_id, {}).get("review_agents", ["code-reviewer"]))
+                required_reviewers = set()
                 verifier_role = verifier.get("role") if isinstance(verifier, dict) else None
                 if not isinstance(verifier, dict) or verifier_role not in required_reviewers:
                     errors.append(f"{record_path}: {gate_id} lacks required reviewer role {sorted(required_reviewers)}")
@@ -1311,13 +1428,11 @@ def validate_repository(args: argparse.Namespace) -> int:
                     errors.append(f"{record_path}: {gate_id} verifier role is not a catalog reviewer")
                 approvals = [approval for approval in gate.get("human_approvals", []) if approval.get("status") == "approved"]
                 approval_roles = {approval.get("approver", {}).get("role") for approval in approvals if isinstance(approval.get("approver"), dict)}
-                required_roles = {ROLE_LABELS[role] for role in gate_contracts.get(gate_id, {}).get("human_authorities", [])}
-                required_roles.update(
-                    requirement.get("role")
-                    for requirement in requirements
+                required_roles = {
+                    requirement.get("role") for requirement in requirements
                     if requirement.get("authority_type") == "human-approver"
                     and requirement.get("applicability") == "applicable"
-                )
+                }
                 if not required_roles.issubset(approval_roles):
                     errors.append(f"{record_path}: {gate_id} lacks required human roles {sorted(required_roles - approval_roles)}")
                 for approval in gate.get("human_approvals", []):
@@ -1454,9 +1569,7 @@ def validate_repository(args: argparse.Namespace) -> int:
             if execution:
                 if execution.get("required_tasks") != item.get("tasks"):
                     errors.append(f"{dispatch_path}: {gate_id} task dispatch does not match the lifecycle contract")
-                if {artifact["artifact_id"] for artifact in execution.get("required_agent_artifacts", [])} != {
-                    f"{gate_id.lower()}-{agent}-attestation" for agent in item.get("agents", [])
-                }:
+                if item.get("artifacts") and execution.get("required_agent_artifacts"):
                     errors.append(f"{dispatch_path}: {gate_id} artifact dispatch does not match configured agents")
     result = {"valid": not errors, "ready": not errors and not blockers, "errors": errors, "blockers": blockers}
     print(json.dumps(result, indent=2))
@@ -1469,6 +1582,9 @@ def status(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     task_id = safe_task_id(args.task_id)
     record = load_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"))
+    routing = load_overlay(root)[4]
+    advance_lifecycle(record, routing)
+    write_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"), record)
     gates = [{"gate_id": gate["gate_id"], "status": gate["status"], "applicability": gate["applicability"], "required_reentry_gate": gate.get("required_reentry_gate")} for gate in record["lifecycle_gates"]]
     print(json.dumps({"task_id": task_id, "current_phase": derive_current_phase(record), "gates": gates, "re_entry_history": record["re_entry_history"]}, indent=2))
     return 0
@@ -1506,6 +1622,49 @@ def invalidate(args: argparse.Namespace) -> int:
         gate["invalidation_history"].append(history)
     write_json(path, record)
     print(json.dumps({"task_id": task_id, "earliest_gate": args.earliest_gate, "invalidated_gate_ids": invalidated}, indent=2))
+    return 0
+
+
+def reenter(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
+    record = load_json(path)
+    start = GATE_IDS.index(args.earliest_gate)
+    for gate in record["lifecycle_gates"][start:]:
+        gate["status"] = "pending"
+        gate["required_reentry_gate"] = None
+        gate["artifact_bindings"] = []
+        gate["evidence_refs"] = []
+        gate["human_approvals"] = []
+        gate["decided_at"] = None
+    advance_lifecycle(record, load_overlay(root)[4])
+    record.setdefault("re_entry_history", []).append({
+        "invalidated_at": now(), "actor": args.actor, "reason": args.reason,
+        "earliest_gate": args.earliest_gate, "invalidated_gate_ids": [],
+        "affected_artifact_bindings": [], "superseding_artifact_id": None,
+    })
+    write_json(path, record)
+    print(json.dumps({"task_id": task_id, "earliest_gate": args.earliest_gate, "status": "reentered"}, indent=2))
+    return 0
+
+
+def upgrade(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    lock_path = confined_path(root, OVERLAY, "version.lock")
+    lock = load_json(lock_path)
+    digest = fingerprint(lifecycle_contract())
+    changes = []
+    if lock.get("kernel_version") != VERSION:
+        changes.append({"field": "kernel_version", "from": lock.get("kernel_version"), "to": VERSION})
+    if lock.get("contract_digest") != digest:
+        changes.append({"field": "contract_digest", "from": lock.get("contract_digest"), "to": digest})
+    result = {"status": "changes-available" if changes else "current", "mutation": False, "changes": changes}
+    if args.apply:
+        lock.update({"plugin_version": VERSION, "kernel_version": VERSION, "contracts": 2, "contract_digest": digest})
+        write_json(lock_path, lock)
+        result.update({"status": "upgraded", "mutation": True})
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -1567,6 +1726,23 @@ def approve_from_github_pr(args: argparse.Namespace) -> int:
     return 0
 
 
+def provider_introspection(args: argparse.Namespace) -> int:
+    if args.resource_kind == "provider":
+        if args.action == "list":
+            print(json.dumps(LOADED_PROVIDERS, indent=2))
+        else:
+            provider = next((item for item in LOADED_PROVIDERS if item["id"] == args.provider_id), None)
+            if provider is None:
+                raise ValueError(f"unknown loaded provider: {args.provider_id}")
+            print(json.dumps(provider, indent=2))
+        return 0
+    if args.resource_kind == "profile":
+        print(json.dumps(sorted(profile_ids()), indent=2))
+        return 0
+    print(json.dumps(sorted(extension_ids()), indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentic-sdlc", description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
@@ -1582,7 +1758,7 @@ def build_parser() -> argparse.ArgumentParser:
     detect.set_defaults(handler=lambda args: (print(json.dumps(detect_repository(Path(args.root)), indent=2)) or 0))
     init = subparsers.add_parser("init", help="Initialize a conservative project overlay")
     init.add_argument("--root", default=".")
-    init.add_argument("--profile", default="auto")
+    init.add_argument("--profile", default=None, help="Provider profile id; omit for kernel-only lifecycle operation")
     init.add_argument("--extension", action="append", help="Enable an impact-profile extension by id (resolved at init time; see EXTENSIONS_SEARCH_PATH)")
     init.add_argument("--project-id")
     init.add_argument("--classification", default="internal")
@@ -1630,10 +1806,31 @@ def build_parser() -> argparse.ArgumentParser:
     invalid.add_argument("--reason", required=True)
     invalid.add_argument("--actor", required=True, help="Accountable identity recording the invalidation")
     invalid.set_defaults(handler=invalidate)
+    reentry = subparsers.add_parser("reenter", help="Prepare an invalidated run for explicit re-entry")
+    reentry.add_argument("--root", default=".")
+    reentry.add_argument("--task-id", required=True)
+    reentry.add_argument("--earliest-gate", choices=GATE_IDS, required=True)
+    reentry.add_argument("--reason", required=True)
+    reentry.add_argument("--actor", required=True)
+    reentry.set_defaults(handler=reenter)
+    upgrade_parser = subparsers.add_parser("upgrade", help="Check or apply a non-destructive kernel lock upgrade")
+    upgrade_parser.add_argument("--root", default=".")
+    mode = upgrade_parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--apply", action="store_true")
+    upgrade_parser.set_defaults(handler=upgrade)
+    for kind in ("provider", "profile", "extension"):
+        group = subparsers.add_parser(kind, help=f"Inspect loaded {kind} resources")
+        group.add_argument("action", choices=["list", "inspect"] if kind == "provider" else ["list"])
+        group.add_argument("--root", default=".", help=argparse.SUPPRESS)
+        group.set_defaults(resource_kind=kind)
+        if kind == "provider":
+            group.add_argument("provider_id", nargs="?")
+        group.set_defaults(handler=lambda args, kind=kind: provider_introspection(args))
     contract = subparsers.add_parser("show-contract", help="Print a bundled lifecycle contract as JSON")
     contract.add_argument(
         "name",
-        choices=["agent-catalog", "artifact.schema", "lifecycle-gates", "mutation-gates", "run-record.schema", "selection.schema"],
+        choices=["artifact.schema", "agent-catalog.schema", "dispatch-bindings.schema", "extension.schema", "lifecycle-gates", "mutation-gates", "profile.schema", "provider.schema", "run-record.schema", "selection.schema"],
     )
     contract.set_defaults(
         handler=lambda args: (

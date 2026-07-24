@@ -67,10 +67,12 @@ class PluginPackageTests(unittest.TestCase):
 
     def test_separated_repository_metadata_is_complete(self) -> None:
         manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual("0.2.0", manifest["version"])
+        self.assertEqual("0.3.0", manifest["version"])
         self.assertEqual("Apache-2.0", manifest["license"])
         self.assertEqual("https://github.com/deagy/agentic-sdlc", manifest["repository"])
         self.assertTrue((PLUGIN_ROOT / "contracts" / "provider.schema.json").is_file())
+        for schema in ("profile.schema.json", "agent-catalog.schema.json", "extension.schema.json", "dispatch-bindings.schema.json"):
+            self.assertTrue((PLUGIN_ROOT / "contracts" / schema).is_file())
         launcher = REPOSITORY_ROOT / "bin" / "agentic-sdlc"
         self.assertTrue(launcher.is_file())
         self.assertTrue(os.access(launcher, os.X_OK))

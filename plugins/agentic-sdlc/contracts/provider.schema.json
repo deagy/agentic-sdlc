@@ -36,6 +36,8 @@
       "type": "array",
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
-    }
+    },
+    "dependencies": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["id", "version_range"], "properties": {"id": {"type": "string"}, "version_range": {"type": "string"}}}},
+    "dispatch_bindings": {"type": "string", "minLength": 1}
   }
 }

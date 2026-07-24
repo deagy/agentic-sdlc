@@ -1,0 +1,157 @@
+"""LangGraph state model for the Phase-0 Agentic SDLC spike.
+
+`GateState` is a field-for-field port of `run-record.schema.json`'s `gate`
+`$def`. `SDLCState` is the graph-level state; the checkpointed value of this
+state *is* the run record for a given `task_id` (one thread per task).
+
+Deliberate simplifications for this spike (see the phase-0 report for the
+full list):
+
+- No `provider_bindings` / `dispatch_binding_digest` / `contract_digest` /
+  `knowledge_retrieval` / `impact_profile` modeling in the live graph state
+  — those are synthesized as schema-satisfying placeholders only at export
+  time (`export.py`), not carried through the graph.
+- `mode`, `baseline_revision`, `disposition`, `intent_record_id`,
+  `requirements_baseline_id` (top-level run-record fields) are likewise
+  handled only at export time, not modeled as live graph state, since
+  nothing in the G1-G3 slice computes them.
+"""
+
+from __future__ import annotations
+
+import operator
+from typing import Annotated, Any, TypedDict
+
+
+class Identity(TypedDict):
+    id: str
+    role: str
+    kind: str  # "human" | "agent" | "service"
+
+
+class ArtifactBinding(TypedDict):
+    artifact_id: str
+    revision: str
+    digest: str
+
+
+class Evidence(TypedDict):
+    evidence_id: str
+    uri: str
+    hash_algorithm: str
+    hash: str
+    classification: str
+
+
+class AuthorityRequirement(TypedDict):
+    authority_id: str
+    authority_type: str  # always "human-approver" in this contract
+    role: str
+    applicability: str  # "applicable" | "not-applicable" | "unknown"
+    rationale: str | None
+
+
+class Approval(TypedDict):
+    status: str  # "pending" | "approved" | "rejected" | "not-required"
+    approver: Identity | None
+    decided_at: str | None
+    evidence_refs: list[Evidence]
+
+
+class IndependenceDeclaration(TypedDict):
+    verifier_confirmed_not_preparer: bool
+    verifier_made_material_correction: bool  # schema pins this to `false`
+
+
+class Finding(TypedDict):
+    finding_id: str
+    severity: str
+    status: str
+    owner: str
+
+
+class Exception_(TypedDict):
+    exception_id: str
+    finding_id: str
+    justification: str
+    compensating_controls: list[str]
+    owner: Identity
+    approver: Identity
+    expires_at: str
+    remediation_plan: str
+
+
+class Invalidation(TypedDict):
+    invalidated_at: str
+    actor: str
+    reason: str
+    earliest_gate: str
+    invalidated_gate_ids: list[str]
+    affected_artifact_bindings: list[ArtifactBinding]
+    superseding_artifact_id: str | None
+
+
+class GateState(TypedDict):
+    tier: str  # "lifecycle" | "specialist"
+    gate_id: str
+    name: str
+    applicability: str  # "applicable" | "not-applicable" | "unknown"
+    applicability_rationale: str | None
+    status: str  # pending|ready|approved|request-changes|needs-information|blocked|invalidated
+    artifact_bindings: list[ArtifactBinding]
+    preparers: list[Identity]
+    independent_verifier: Identity | None
+    independence_declaration: IndependenceDeclaration
+    authority_requirements: list[AuthorityRequirement]
+    human_approvals: list[Approval]
+    decided_at: str | None
+    evidence_refs: list[Evidence]
+    knowledge_status: str
+    findings: list[Finding]
+    exceptions: list[Exception_]
+    invalidation_history: list[Invalidation]
+    required_reentry_gate: str | None
+
+
+def merge_gate_updates(
+    current: dict[str, GateState] | None, update: dict[str, GateState] | None
+) -> dict[str, GateState]:
+    """Per-gate-id dict merge reducer.
+
+    Parallel `Send` branches (and sequential nodes) touching different gate
+    ids must not clobber each other's entries. Each key in `update` fully
+    replaces the corresponding key in `current` (nodes are expected to read
+    the current gate dict and return a complete replacement for that gate
+    id, not a sparse patch) while every other gate id in `current` is left
+    untouched.
+    """
+    current = dict(current or {})
+    update = update or {}
+    current.update(update)
+    return current
+
+
+class SDLCState(TypedDict):
+    task_id: str
+    classification: str
+    scope: str  # the task text; also what routing/mutation-gate matching reads
+    current_lifecycle_phase: str
+
+    lifecycle_gates: Annotated[dict[str, GateState], merge_gate_updates]
+
+    re_entry_history: Annotated[list[Invalidation], operator.add]
+
+    # authority-assignment map fed in at invoke time, e.g.
+    # {"product_owner": {"status": "assigned"}, ...}. Not part of the
+    # exported run-record schema; mirrors the project `authorities.json`
+    # overlay file from the legacy CLI.
+    authorities: dict[str, dict[str, Any]]
+
+    # map-reduce fan-in scratch field: every dispatched agent node appends
+    # one AgentOutput-shaped dict here. Consumed by gate_decision_{gate_id}
+    # nodes and filtered by `gate_id`; never exported.
+    agent_outputs: Annotated[list[dict[str, Any]], operator.add]
+
+    # populated by the mutation-gate guard at graph entry; independent of
+    # gate/authority approval status.
+    mutation_gate_pending: dict[str, Any] | None

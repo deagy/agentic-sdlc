@@ -305,7 +305,7 @@ def build_graph(
 
         # gate_decision_{gate_id}: pure merge + separation-of-duties enforcement
         def gate_decision(state: SDLCState, gate=gate, gate_id=gate_id) -> dict[str, Any]:
-            outputs = [o for o in state.get("agent_outputs", []) if o.get("gate_id") == gate_id]
+            outputs = [o for o in state.get("agent_outputs", {}).values() if o.get("gate_id") == gate_id]
             preparers = [o["identity"] for o in outputs if o.get("kind") == "author"]
             reviewer_outputs = [o for o in outputs if o.get("kind") == "reviewer"]
             # Spike simplification: at most one independent verifier is

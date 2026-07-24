@@ -131,6 +131,31 @@ def merge_gate_updates(
     return current
 
 
+def merge_agent_outputs(
+    current: dict[str, dict[str, Any]] | None, update: dict[str, dict[str, Any]] | None
+) -> dict[str, dict[str, Any]]:
+    """Per-dispatch-slot dict merge reducer for `agent_outputs`.
+
+    Keyed by `f"{gate_id}:{kind}:{agent_id}"` (one slot per agent per role
+    per gate), with the same later-write-wins semantics as
+    `merge_gate_updates`. This fixes a real duplication bug: with a plain
+    `operator.add` (append-only) list reducer, re-dispatching a gate's
+    agents after `reenter_gate` would leave the gate's stale
+    pre-invalidation outputs sitting in the list alongside the fresh ones
+    -- `gate_decision_{gate_id}` filters only by `gate_id`, so it would
+    pick up both, duplicating `preparers`/`artifact_bindings`/
+    `evidence_refs`. Keying by dispatch slot means a redispatch of the
+    same agent/role/gate simply overwrites its own prior entry instead of
+    appending a duplicate, while parallel `Send` branches for *different*
+    agents within the same gate still get distinct keys and never clobber
+    each other.
+    """
+    current = dict(current or {})
+    update = update or {}
+    current.update(update)
+    return current
+
+
 class SDLCState(TypedDict):
     task_id: str
     classification: str
@@ -147,10 +172,12 @@ class SDLCState(TypedDict):
     # overlay file from the legacy CLI.
     authorities: dict[str, dict[str, Any]]
 
-    # map-reduce fan-in scratch field: every dispatched agent node appends
-    # one AgentOutput-shaped dict here. Consumed by gate_decision_{gate_id}
-    # nodes and filtered by `gate_id`; never exported.
-    agent_outputs: Annotated[list[dict[str, Any]], operator.add]
+    # map-reduce fan-in scratch field, keyed by `f"{gate_id}:{kind}:{agent_id}"`
+    # (see `merge_agent_outputs`): every dispatched agent node writes one
+    # AgentOutput-shaped dict to its own slot here. Consumed by
+    # gate_decision_{gate_id} nodes and filtered by `gate_id`; never
+    # exported.
+    agent_outputs: Annotated[dict[str, dict[str, Any]], merge_agent_outputs]
 
     # populated by the mutation-gate guard at graph entry; independent of
     # gate/authority approval status. Non-None whenever a human-only

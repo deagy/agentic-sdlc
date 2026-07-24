@@ -76,7 +76,7 @@ def _initial_state(task_id: str) -> dict:
             "engineering_lead": {"status": "assigned"},
             "system_architect": {"status": "assigned"},
         },
-        "agent_outputs": [],
+        "agent_outputs": {},
         "mutation_gate_pending": None,
         "mutation_gate_decision": None,
         "run_halted": False,
@@ -183,8 +183,23 @@ def test_invalidate_then_reenter_preserve_history_but_clear_stale_bindings_and_r
     # -- an actual node executed).
     assert state["lifecycle_gates"]["G2"]["status"] == "ready"
     assert state["lifecycle_gates"]["G2"]["preparers"], "G2's author must have been dispatched again"
+    # Regression pin: `agent_outputs` is keyed by
+    # f"{gate_id}:{kind}:{agent_id}" (`state.merge_agent_outputs`), not an
+    # append-only list, precisely so a redispatch after reenter overwrites
+    # its own prior slot instead of duplicating alongside the stale
+    # pre-invalidation output. G2 has exactly one bound author
+    # (requirements-agent, -> 1 preparer) and one reviewer (code-reviewer,
+    # via the matched route), each contributing one artifact_binding (one
+    # from the author's output, one from the reviewer's) -- if this were
+    # still append-only, re-dispatching G2 would leave the old
+    # pre-invalidation outputs sitting in the list too, and these counts
+    # would be doubled (2 preparers, 4 artifact_bindings).
+    assert len(state["lifecycle_gates"]["G2"]["preparers"]) == 1
+    assert len(state["lifecycle_gates"]["G2"]["artifact_bindings"]) == 2
+    assert state["lifecycle_gates"]["G2"]["independent_verifier"] is not None
     # G1 still untouched throughout.
     assert state["lifecycle_gates"]["G1"]["status"] == "approved"
+    assert len(state["lifecycle_gates"]["G1"]["preparers"]) == 1
 
 
 def test_reenter_gate_resolves_predecessor_via_mutation_gate_check_when_earliest_gate_is_first():

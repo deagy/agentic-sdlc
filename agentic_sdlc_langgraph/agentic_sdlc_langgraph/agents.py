@@ -304,8 +304,12 @@ def make_agent_node(
 
     The node reads `gate_id` and `task_text` off whatever payload the
     triggering `Send` carried (see graph.py's dispatch conditional edges)
-    and returns a state update appending one `AgentOutput` dict to the
-    `agent_outputs` map-reduce scratch field.
+    and returns a state update writing one `AgentOutput` dict to its own
+    `f"{gate_id}:{kind}:{agent_id}"` slot in the `agent_outputs`
+    map-reduce scratch field (see `state.merge_agent_outputs` for why this
+    is a keyed dict, not an append-only list: a redispatch of the same
+    agent/role/gate -- e.g. after `reenter_gate` -- must overwrite its own
+    prior output, not duplicate it alongside a stale one).
 
     `metadata` (the agent's own agent-catalog entry, e.g.
     `agent_catalog.get(agent_id, {})`) and `profile` (the active profile
@@ -330,6 +334,7 @@ def make_agent_node(
             role_prompt=role_prompt,
             task_text=task_text,
         )
-        return {"agent_outputs": [dict(output)]}
+        slot_key = f"{gate_id}:{kind}:{agent_id}"
+        return {"agent_outputs": {slot_key: dict(output)}}
 
     return node

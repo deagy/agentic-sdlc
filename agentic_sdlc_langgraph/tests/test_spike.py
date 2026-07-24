@@ -97,7 +97,7 @@ def test_g1_g3_interrupt_resume_and_export(contracts):
             "engineering_lead": {"status": "assigned"},
             "system_architect": {"status": "assigned"},
         },
-        "agent_outputs": [],
+        "agent_outputs": {},
         "mutation_gate_pending": None,
         "mutation_gate_decision": None,
         "run_halted": False,
@@ -242,7 +242,7 @@ def test_separation_of_duties_blocks_gate_when_reviewer_equals_author(contracts)
         "lifecycle_gates": {},
         "re_entry_history": [],
         "authorities": {"product_owner": {"status": "assigned"}},
-        "agent_outputs": [],
+        "agent_outputs": {},
         "mutation_gate_pending": None,
         "mutation_gate_decision": None,
         "run_halted": False,
@@ -399,7 +399,7 @@ def test_full_g1_g10_happy_path_interrupts_in_order_and_exports_clean(contracts)
         "lifecycle_gates": {},
         "re_entry_history": [],
         "authorities": _full_chain_authorities(),
-        "agent_outputs": [],
+        "agent_outputs": {},
         "mutation_gate_pending": None,
         "mutation_gate_decision": None,
         "run_halted": False,
@@ -504,7 +504,7 @@ def _mutation_initial_state(task_id, scope):
             "engineering_lead": {"status": "assigned"},
             "system_architect": {"status": "assigned"},
         },
-        "agent_outputs": [],
+        "agent_outputs": {},
         "mutation_gate_pending": None,
         "mutation_gate_decision": None,
         "run_halted": False,
@@ -526,7 +526,7 @@ def test_mutation_gate_hard_interrupt_blocks_dispatch_until_authorized(contracts
 
     state_snapshot = graph.get_state(config)
     assert state_snapshot.values["lifecycle_gates"] == {}
-    assert state_snapshot.values["agent_outputs"] == []
+    assert state_snapshot.values["agent_outputs"] == {}
 
     # (b) authorizing lets the run proceed normally into G1's dispatch.
     result = graph.invoke(
@@ -578,7 +578,7 @@ def test_mutation_gate_hard_interrupt_halts_run_when_rejected(contracts):
     # No gate was ever dispatched -- every included gate stays absent
     # from lifecycle_gates (structurally "pending" once exported).
     assert final_state["lifecycle_gates"] == {}
-    assert final_state["agent_outputs"] == []
+    assert final_state["agent_outputs"] == {}
 
     record = export_run_record(final_state, sequence_gate_ids=["G1", "G2", "G3"])
     schema = __import__("json").loads(

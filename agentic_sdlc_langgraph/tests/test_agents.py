@@ -203,7 +203,7 @@ def test_build_graph_threads_rich_role_definition_through_to_dispatched_agents(t
         "lifecycle_gates": {},
         "re_entry_history": [],
         "authorities": {"product_owner": {"status": "assigned"}},
-        "agent_outputs": [],
+        "agent_outputs": {},
         "mutation_gate_pending": None,
         "mutation_gate_decision": None,
         "run_halted": False,

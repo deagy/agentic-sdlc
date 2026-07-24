@@ -1,0 +1,137 @@
+"""Tests for `agentic_sdlc_langgraph.service` (the minimal FastAPI
+service), via FastAPI's `TestClient`.
+
+Each `client.post`/`client.get` call below goes through a full HTTP
+request/response cycle against the real route handlers in `service.py`,
+none of which hold a graph object in any module-level or fixture-level
+variable between calls -- every handler rebuilds the graph fresh via
+`runtime.build_graph_for_task` and lets the on-disk sqlite checkpointer
+(named by `root` in the request body/query string) carry state from one
+call to the next, exactly as separate CLI process invocations do (see
+`test_cli.py`'s `test_plan_then_resume_across_separate_processes` for the
+real-subprocess version of this same proof).
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from agentic_sdlc_langgraph.service import app
+
+TASK_TEXT = "Define and review a small internal order-processing API architecture and service"
+
+APPROVAL = {
+    "status": "approved",
+    "approver": {"id": "product_owner", "role": "Product Owner", "kind": "human"},
+    "evidence_refs": [],
+}
+
+
+@pytest.fixture(autouse=True)
+def _fake_model(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL", "1")
+
+
+@pytest.fixture()
+def client() -> TestClient:
+    return TestClient(app)
+
+
+def test_create_task_interrupts_at_g1(client: TestClient, tmp_path):
+    response = client.post(
+        "/tasks",
+        json={"task_id": "svc-1", "task": TASK_TEXT, "root": str(tmp_path)},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "interrupted"
+    assert payload["interrupt"]["gate_id"] == "G1"
+    assert (tmp_path / ".agentic-sdlc" / "runs" / "svc-1" / "graph-config.json").is_file()
+
+
+def test_create_task_twice_is_a_noop_second_time(client: TestClient, tmp_path):
+    client.post("/tasks", json={"task_id": "svc-1", "task": TASK_TEXT, "root": str(tmp_path)})
+    response = client.post(
+        "/tasks", json={"task_id": "svc-1", "task": TASK_TEXT, "root": str(tmp_path)}
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "already-planned"
+
+
+def test_create_task_conflicting_text_is_409(client: TestClient, tmp_path):
+    client.post("/tasks", json={"task_id": "svc-1", "task": TASK_TEXT, "root": str(tmp_path)})
+    response = client.post(
+        "/tasks", json={"task_id": "svc-1", "task": "a different task text", "root": str(tmp_path)}
+    )
+    assert response.status_code == 409
+
+
+def test_resume_unknown_task_is_404(client: TestClient, tmp_path):
+    response = client.post(
+        "/tasks/does-not-exist/resume", json={"root": str(tmp_path), "decision": APPROVAL}
+    )
+    assert response.status_code == 404
+
+
+def test_status_unknown_task_is_404(client: TestClient, tmp_path):
+    response = client.get("/tasks/does-not-exist", params={"root": str(tmp_path)})
+    assert response.status_code == 404
+
+
+def test_full_g1_g3_lifecycle_via_http(client: TestClient, tmp_path):
+    root = str(tmp_path)
+
+    response = client.post("/tasks", json={"task_id": "svc-1", "task": TASK_TEXT, "root": root})
+    assert response.json()["interrupt"]["gate_id"] == "G1"
+
+    for expected_next in ("G2", "G3"):
+        response = client.post(
+            "/tasks/svc-1/resume", json={"root": root, "decision": APPROVAL}
+        )
+        assert response.status_code == 200
+        assert response.json()["interrupt"]["gate_id"] == expected_next
+
+    response = client.post("/tasks/svc-1/resume", json={"root": root, "decision": APPROVAL})
+    assert response.json()["status"] == "complete"
+
+    # A completely fresh GET (no object shared with the POST calls above
+    # beyond the on-disk sqlite file) confirms durable persistence.
+    response = client.get("/tasks/svc-1", params={"root": root})
+    assert response.status_code == 200
+    status = response.json()
+    assert status["interrupted"] is False
+    assert [g["status"] for g in status["gates"]] == ["approved", "approved", "approved"]
+    assert status["re_entry_history_length"] == 0
+
+
+def test_service_and_cli_share_the_same_on_disk_state(tmp_path):
+    """The service and the CLI must be interchangeable against the same
+    `root`/`task_id`: plan via the service, resume via the CLI. Proves
+    `runtime.build_graph_for_task` is genuinely the single shared
+    reconnection path both entrypoints use, not two divergent
+    implementations that happen to look similar.
+    """
+    import json as json_module
+
+    from agentic_sdlc_langgraph import cli
+
+    root = tmp_path
+    client = TestClient(app)
+
+    response = client.post(
+        "/tasks", json={"task_id": "shared-1", "task": TASK_TEXT, "root": str(root)}
+    )
+    assert response.json()["interrupt"]["gate_id"] == "G1"
+
+    decision_path = root / "decision.json"
+    decision_path.write_text(json_module.dumps(APPROVAL), encoding="utf-8")
+    code = cli.main(
+        ["resume", "--root", str(root), "--task-id", "shared-1", "--decision", str(decision_path)]
+    )
+    assert code == 0
+
+    response = client.get("/tasks/shared-1", params={"root": str(root)})
+    status = response.json()
+    assert status["gates"][0]["status"] == "approved"  # G1, approved via the CLI
+    assert status["interrupt"]["gate_id"] == "G2"  # now suspended at G2, via the service's own view

@@ -16,22 +16,15 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CONTRACTS = PLUGIN_ROOT / "contracts"
 PROFILES = PLUGIN_ROOT / "profiles"
 EXTENSIONS = PLUGIN_ROOT / "extensions"
-# Extensions are optional impact-profile add-ons. The portable kernel ships none of
-# its own; this repository's own domain plugin contributes them from its own
-# directory when present alongside this one, without agentic-sdlc depending on it.
-EXTENSIONS_SEARCH_PATH = [EXTENSIONS, PLUGIN_ROOT.parent / "secure-cloud-agents" / "extensions"]
-# Same pattern as EXTENSIONS_SEARCH_PATH: the built-in catalog covers the generic
-# roles the kernel ships with; a sibling secure-cloud-agents contributes richer,
-# real role definitions when present, without this plugin depending on it.
-AGENT_CATALOG_SEARCH_PATH = [
-    CONTRACTS / "agent-catalog.json",
-    PLUGIN_ROOT.parent / "secure-cloud-agents" / "agent-catalog.json",
-]
+PROFILE_SEARCH_PATH = [PROFILES]
+EXTENSIONS_SEARCH_PATH = [EXTENSIONS]
+AGENT_CATALOG_SEARCH_PATH = [CONTRACTS / "agent-catalog.json"]
+LOADED_PROVIDERS: list[dict[str, Any]] = []
 OVERLAY = ".agentic-sdlc"
 GATE_IDS = [f"G{number}" for number in range(1, 11)]
 REQUIRED_AUTHORITY_ROLES = {
@@ -82,6 +75,113 @@ def is_valid_datetime(value: Any) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None
+
+
+def semver_tuple(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", value)
+    if not match:
+        raise ValueError(f"invalid semantic version: {value}")
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def provider_resource(root: Path, value: Any, field: str, *, directory: bool) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"provider {field} must be a non-empty relative path")
+    candidate = (root / value).resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"provider {field} escapes its manifest directory")
+    if directory and not candidate.is_dir():
+        raise ValueError(f"provider {field} directory does not exist: {value}")
+    if not directory and not candidate.is_file():
+        raise ValueError(f"provider {field} file does not exist: {value}")
+    return candidate
+
+
+def profile_ids() -> set[str]:
+    return {
+        path.name
+        for root in PROFILE_SEARCH_PATH
+        if root.is_dir()
+        for path in root.iterdir()
+        if path.is_dir() and (path / "profile.json").is_file()
+    }
+
+
+def extension_ids() -> set[str]:
+    return {
+        path.name
+        for root in EXTENSIONS_SEARCH_PATH
+        if root.is_dir()
+        for path in root.iterdir()
+        if path.is_dir() and (path / "extension.json").is_file()
+    }
+
+
+def load_provider(manifest_path: str) -> None:
+    path = Path(manifest_path).resolve()
+    manifest = load_json(path)
+    if manifest.get("schema_version") != 1:
+        raise ValueError(f"unsupported provider schema in {path}")
+    provider_id = manifest.get("id")
+    provider_version = manifest.get("version")
+    if not isinstance(provider_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", provider_id):
+        raise ValueError(f"invalid provider id in {path}")
+    if provider_id in {item["id"] for item in LOADED_PROVIDERS}:
+        raise ValueError(f"duplicate provider id: {provider_id}")
+    version = semver_tuple(str(provider_version))
+    compatibility = manifest.get("kernel_compatibility")
+    if not isinstance(compatibility, dict):
+        raise ValueError(f"provider {provider_id} is missing kernel_compatibility")
+    minimum = semver_tuple(str(compatibility.get("minimum")))
+    maximum = semver_tuple(str(compatibility.get("maximum_exclusive")))
+    if not minimum <= semver_tuple(VERSION) < maximum:
+        raise ValueError(f"provider {provider_id} {provider_version} is incompatible with kernel {VERSION}")
+
+    root = path.parent
+    catalog = provider_resource(root, manifest.get("agent_catalog"), "agent_catalog", directory=False)
+    profile_roots = [
+        provider_resource(root, item, "profile_roots", directory=True)
+        for item in manifest.get("profile_roots", [])
+    ]
+    extension_roots = [
+        provider_resource(root, item, "extension_roots", directory=True)
+        for item in manifest.get("extension_roots", [])
+    ]
+    if not profile_roots:
+        raise ValueError(f"provider {provider_id} must define at least one profile root")
+
+    existing_profiles = profile_ids()
+    supplied_profiles = {
+        child.name
+        for profile_root in profile_roots
+        for child in profile_root.iterdir()
+        if child.is_dir() and (child / "profile.json").is_file()
+    }
+    duplicate_profiles = existing_profiles.intersection(supplied_profiles)
+    if duplicate_profiles:
+        raise ValueError(f"provider {provider_id} duplicates profile ids: {sorted(duplicate_profiles)}")
+    existing_extensions = extension_ids()
+    supplied_extensions = {
+        child.name
+        for extension_root in extension_roots
+        for child in extension_root.iterdir()
+        if child.is_dir() and (child / "extension.json").is_file()
+    }
+    duplicate_extensions = existing_extensions.intersection(supplied_extensions)
+    if duplicate_extensions:
+        raise ValueError(f"provider {provider_id} duplicates extension ids: {sorted(duplicate_extensions)}")
+
+    PROFILE_SEARCH_PATH.extend(profile_roots)
+    EXTENSIONS_SEARCH_PATH.extend(extension_roots)
+    AGENT_CATALOG_SEARCH_PATH.append(catalog)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    LOADED_PROVIDERS.append(
+        {
+            "id": provider_id,
+            "version": ".".join(str(part) for part in version),
+            "manifest_sha256": f"sha256:{digest}",
+        }
+    )
 
 
 def approval_source_policy(project: dict[str, Any]) -> dict[str, Any]:
@@ -418,9 +518,16 @@ def detect_repository(root: Path) -> dict[str, Any]:
 
 
 def merge_profile(profile_id: str) -> dict[str, Any]:
-    path = PROFILES / profile_id / "profile.json"
-    if not path.exists():
+    candidates = [
+        root / profile_id / "profile.json"
+        for root in PROFILE_SEARCH_PATH
+        if (root / profile_id / "profile.json").is_file()
+    ]
+    if not candidates:
         raise ValueError(f"unknown profile: {profile_id}")
+    if len(candidates) > 1:
+        raise ValueError(f"duplicate profile: {profile_id}")
+    path = candidates[0]
     child = load_json(path)
     parent_id = child.get("extends")
     if not parent_id:
@@ -494,7 +601,12 @@ def load_agent_catalog() -> dict[str, Any]:
     merged: dict[str, Any] = {}
     for path in AGENT_CATALOG_SEARCH_PATH:
         if path.exists():
-            merged.update(load_json(path)["agents"])
+            catalog = load_json(path)["agents"]
+            for metadata in catalog.values():
+                definition = metadata.get("definition")
+                if isinstance(definition, str) and not Path(definition).is_absolute():
+                    metadata["definition"] = str((path.parent / definition).resolve())
+            merged.update(catalog)
     return merged
 
 
@@ -614,6 +726,7 @@ def initialize(args: argparse.Namespace) -> int:
         "classification": args.classification,
         "profile": profile_id,
         "extensions": extension_ids,
+        "providers": [item["id"] for item in LOADED_PROVIDERS],
         "approval_sources": {
             "human_gate_default": "manual",
             "allow_manual_fallback": True,
@@ -649,7 +762,12 @@ def initialize(args: argparse.Namespace) -> int:
     if args.force or not lock.exists():
         lock.write_text(
             json.dumps(
-                {"plugin_version": VERSION, "kernel_version": VERSION, "contracts": 1},
+                {
+                    "plugin_version": VERSION,
+                    "kernel_version": VERSION,
+                    "contracts": 1,
+                    "providers": LOADED_PROVIDERS,
+                },
                 indent=2,
             )
             + "\n",
@@ -953,7 +1071,7 @@ def validate_repository(args: argparse.Namespace) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(json.dumps({"valid": False, "ready": False, "errors": [str(error)], "blockers": []}, indent=2))
         return 1
-    if project.get("profile") not in {path.name for path in PROFILES.iterdir() if path.is_dir()}:
+    if project.get("profile") not in profile_ids():
         errors.append("project profile is not installed")
     try:
         approval_policy = approval_source_policy(project)
@@ -978,6 +1096,8 @@ def validate_repository(args: argparse.Namespace) -> int:
         errors.append(
             f"project kernel lock {lock.get('kernel_version')} does not match installed version {VERSION}"
         )
+    if lock and lock.get("providers", []) != LOADED_PROVIDERS:
+        errors.append("loaded providers do not match the project provider lock")
     for role in AUTHORITY_ROLES:
         value = authorities.get(role)
         if not isinstance(value, dict):
@@ -1010,7 +1130,7 @@ def validate_repository(args: argparse.Namespace) -> int:
     unknown_ignored = set(routing.get("ignored_gates", [])) - set(GATE_IDS)
     if unknown_ignored:
         errors.append(f"routing ignored_gates contains unknown lifecycle gates: {sorted(unknown_ignored)}")
-    agent_catalog = load_json(CONTRACTS / "agent-catalog.json")["agents"]
+    agent_catalog = load_agent_catalog()
     known_agents = set(agent_catalog)
     for route in routing.get("routes", []):
         route_id = route.get("id")
@@ -1450,13 +1570,19 @@ def approve_from_github_pr(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentic-sdlc", description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument(
+        "--provider",
+        action="append",
+        default=[],
+        help="Load a versioned external profile, catalog, and extension provider manifest",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     detect = subparsers.add_parser("detect", help="Detect repository stack without changing files")
     detect.add_argument("--root", default=".")
     detect.set_defaults(handler=lambda args: (print(json.dumps(detect_repository(Path(args.root)), indent=2)) or 0))
     init = subparsers.add_parser("init", help="Initialize a conservative project overlay")
     init.add_argument("--root", default=".")
-    init.add_argument("--profile", choices=["auto"] + sorted(path.name for path in PROFILES.iterdir() if path.is_dir()), default="auto")
+    init.add_argument("--profile", default="auto")
     init.add_argument("--extension", action="append", help="Enable an impact-profile extension by id (resolved at init time; see EXTENSIONS_SEARCH_PATH)")
     init.add_argument("--project-id")
     init.add_argument("--classification", default="internal")
@@ -1504,12 +1630,24 @@ def build_parser() -> argparse.ArgumentParser:
     invalid.add_argument("--reason", required=True)
     invalid.add_argument("--actor", required=True, help="Accountable identity recording the invalidation")
     invalid.set_defaults(handler=invalidate)
+    contract = subparsers.add_parser("show-contract", help="Print a bundled lifecycle contract as JSON")
+    contract.add_argument(
+        "name",
+        choices=["agent-catalog", "artifact.schema", "lifecycle-gates", "mutation-gates", "run-record.schema", "selection.schema"],
+    )
+    contract.set_defaults(
+        handler=lambda args: (
+            print((CONTRACTS / f"{args.name}.json").read_text(encoding="utf-8").rstrip()) or 0
+        )
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
+        for provider in args.provider:
+            load_provider(provider)
         return int(args.handler(args))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(json.dumps({"error": str(error)}, indent=2), file=sys.stderr)

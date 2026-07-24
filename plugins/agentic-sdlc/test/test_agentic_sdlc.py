@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +23,68 @@ class PortableCliTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.provider_root = self.root / "provider"
+        (self.provider_root / "profiles" / "secure-cloud").mkdir(parents=True)
+        (self.provider_root / "extensions" / "sqs-platform").mkdir(parents=True)
+        (self.provider_root / "roles").mkdir()
+        (self.provider_root / "roles" / "backend-engineer.md").write_text(
+            "# Backend engineer\n\n## Authority\n\nUse pgx where the project approves it.\n",
+            encoding="utf-8",
+        )
+        (self.provider_root / "agent-catalog.json").write_text(
+            json.dumps(
+                {
+                    "agents": {
+                        "backend-engineer": {
+                            "phase": "build",
+                            "kind": "author",
+                            "definition": "roles/backend-engineer.md",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.provider_root / "profiles" / "secure-cloud" / "profile.json").write_text(
+            json.dumps(
+                {
+                    "id": "secure-cloud",
+                    "extends": "generic",
+                    "rich_content_source": "secure-cloud-agents",
+                    "agents": ["backend-engineer"],
+                    "routing": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.provider_root / "extensions" / "sqs-platform" / "extension.json").write_text(
+            json.dumps(
+                {
+                    "id": "sqs-platform",
+                    "impact_categories": ["platform-phase"],
+                    "specialized_boms": ["QBOM"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.provider = self.provider_root / "provider.json"
+        self.provider.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "id": "secure-cloud-agents",
+                    "version": "0.2.0",
+                    "kernel_compatibility": {
+                        "minimum": "0.2.0",
+                        "maximum_exclusive": "0.3.0",
+                    },
+                    "agent_catalog": "agent-catalog.json",
+                    "profile_roots": ["profiles"],
+                    "extension_roots": ["extensions"],
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -31,6 +92,25 @@ class PortableCliTests(unittest.TestCase):
     def run_cli(self, *arguments, expected=0):
         result = subprocess.run(
             [sys.executable, str(CLI), *arguments, "--root", str(self.root)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(expected, result.returncode, result.stderr or result.stdout)
+        stream = result.stdout if result.stdout.strip() else result.stderr
+        return json.loads(stream)
+
+    def run_cli_provider(self, *arguments, expected=0):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "--provider",
+                str(self.provider),
+                *arguments,
+                "--root",
+                str(self.root),
+            ],
             text=True,
             capture_output=True,
             check=False,
@@ -88,49 +168,53 @@ class PortableCliTests(unittest.TestCase):
         self.assertTrue((self.root / ".claude" / "agents" / "security-reviewer.md").exists())
         self.assertFalse((self.root / ".codex").exists())
 
-    def test_secure_cloud_profile_covers_all_34_catalog_roles(self):
-        catalog_path = PLUGIN_ROOT.parents[1] / "agents" / "catalog.yaml"
-        catalog_ids = {
-            line.strip().rstrip(":")
-            for line in catalog_path.read_text(encoding="utf-8").splitlines()
-            if line.startswith("  ") and not line.startswith("    ") and line.rstrip().endswith(":")
-        }
-        self.run_cli("init", "--profile", "secure-cloud", "--runner", "claude")
-        generated_ids = {path.stem for path in (self.root / ".claude" / "agents").glob("*.md")}
-        self.assertEqual(catalog_ids, generated_ids)
-
-    def test_secure_cloud_profile_bakes_in_real_role_content(self):
-        self.run_cli("init", "--profile", "secure-cloud", "--runner", "claude")
+    def test_provider_profile_bakes_in_real_role_content(self):
+        self.run_cli_provider("init", "--profile", "secure-cloud", "--runner", "claude")
         wrapper = (self.root / ".claude" / "agents" / "backend-engineer.md").read_text(encoding="utf-8")
         self.assertIn("## Authority", wrapper)
         self.assertIn("pgx", wrapper)
         self.assertNotIn("Act as the portable Agentic SDLC role", wrapper)
         self.assertIn("You are a dispatched subagent", wrapper)
+        project = self.load(".agentic-sdlc/project.json")
+        lock = self.load(".agentic-sdlc/version.lock")
+        self.assertEqual(["secure-cloud-agents"], project["providers"])
+        self.assertEqual("secure-cloud-agents", lock["providers"][0]["id"])
 
     def test_non_secure_cloud_profiles_are_unaffected_by_rich_content_availability(self):
         self.run_cli("init", "--profile", "generic", "--runner", "claude")
         wrapper = (self.root / ".claude" / "agents" / "application-engineer.md").read_text(encoding="utf-8")
         self.assertIn("Act as the portable Agentic SDLC role application-engineer", wrapper)
 
-    def test_secure_cloud_profile_falls_back_to_generic_stub_without_sibling_plugin(self):
-        with tempfile.TemporaryDirectory() as isolated_parent:
-            isolated_plugin = Path(isolated_parent) / "agentic-sdlc"
-            shutil.copytree(PLUGIN_ROOT, isolated_plugin)
-            isolated_cli = isolated_plugin / "scripts" / "agentic_sdlc.py"
-            result = subprocess.run(
-                [sys.executable, str(isolated_cli), "init", "--profile", "secure-cloud", "--runner", "claude", "--root", str(self.root)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(0, result.returncode, result.stderr or result.stdout)
-        wrapper = (self.root / ".claude" / "agents" / "backend-engineer.md").read_text(encoding="utf-8")
-        self.assertIn("Act as the portable Agentic SDLC role backend-engineer", wrapper)
+    def test_provider_profile_is_unavailable_without_explicit_provider(self):
+        result = self.run_cli("init", "--profile", "secure-cloud", expected=1)
+        self.assertIn("unknown profile", result["error"])
+
+    def test_provider_rejects_incompatible_kernel_version(self):
+        manifest = json.loads(self.provider.read_text(encoding="utf-8"))
+        manifest["kernel_compatibility"]["minimum"] = "0.3.0"
+        self.provider.write_text(json.dumps(manifest), encoding="utf-8")
+        result = self.run_cli_provider("init", "--profile", "secure-cloud", expected=1)
+        self.assertIn("incompatible", result["error"])
+
+    def test_provider_rejects_resource_path_escape(self):
+        manifest = json.loads(self.provider.read_text(encoding="utf-8"))
+        manifest["agent_catalog"] = "../outside.json"
+        (self.root / "outside.json").write_text('{"agents": {}}', encoding="utf-8")
+        self.provider.write_text(json.dumps(manifest), encoding="utf-8")
+        result = self.run_cli_provider("init", "--profile", "secure-cloud", expected=1)
+        self.assertIn("escapes", result["error"])
+
+    def test_provider_rejects_duplicate_builtin_profile(self):
+        duplicate = self.provider_root / "profiles" / "generic"
+        duplicate.mkdir()
+        (duplicate / "profile.json").write_text('{"id": "generic"}', encoding="utf-8")
+        result = self.run_cli_provider("init", "--profile", "generic", expected=1)
+        self.assertIn("duplicates profile ids", result["error"])
 
     def test_init_creates_overlay_wrappers_and_preserves_agents_content(self):
         original = "# Existing rules\n\nKeep this.\n"
         (self.root / "AGENTS.md").write_text(original, encoding="utf-8")
-        result = self.init("--extension", "sqs-platform")
+        result = self.run_cli_provider("init", "--profile", "generic", "--extension", "sqs-platform")
         self.assertEqual("initialized", result["status"])
         for name in ["project.json", "authorities.json", "impact-profile.json", "routing.json", "commands.json", "version.lock"]:
             self.assertTrue((self.root / ".agentic-sdlc" / name).exists())

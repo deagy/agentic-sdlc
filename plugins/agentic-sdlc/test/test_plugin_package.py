@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import unittest
 from pathlib import Path
@@ -63,6 +64,16 @@ class PluginPackageTests(unittest.TestCase):
                 self.assertEqual({"name", "description"}, keys)
                 self.assertIn(f"name: {skill_name}", frontmatter)
                 self.assertTrue((skill_root / skill_name / "agents" / "openai.yaml").is_file())
+
+    def test_separated_repository_metadata_is_complete(self) -> None:
+        manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual("0.2.0", manifest["version"])
+        self.assertEqual("Apache-2.0", manifest["license"])
+        self.assertEqual("https://github.com/deagy/agentic-sdlc", manifest["repository"])
+        self.assertTrue((PLUGIN_ROOT / "contracts" / "provider.schema.json").is_file())
+        launcher = REPOSITORY_ROOT / "bin" / "agentic-sdlc"
+        self.assertTrue(launcher.is_file())
+        self.assertTrue(os.access(launcher, os.X_OK))
 
 
 if __name__ == "__main__":

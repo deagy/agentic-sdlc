@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+
+for candidate in python3 python; do
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    exec "$candidate" "$REPO_ROOT/plugins/agentic-sdlc/scripts/agentic_sdlc.py" "$@"
+  fi
+done
+
+echo "agentic-sdlc: Python 3.10+ is required" >&2
+exit 1

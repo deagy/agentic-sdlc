@@ -1,0 +1,20 @@
+{
+  "name": "agentic-sdlc",
+  "interface": {
+    "displayName": "Agentic SDLC"
+  },
+  "plugins": [
+    {
+      "name": "agentic-sdlc",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agentic-sdlc"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,13 +1,14 @@
 {
   "name": "agentic-sdlc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Portable, governed agentic software delivery lifecycle for Codex CLI and Claude Code projects.",
   "author": {
     "name": "Agents maintainers",
-    "url": "https://github.com/deagy/agents"
+    "url": "https://github.com/deagy"
   },
-  "homepage": "https://github.com/deagy/agents/tree/main/plugins/agentic-sdlc",
-  "repository": "https://github.com/deagy/agents",
+  "homepage": "https://github.com/deagy/agentic-sdlc",
+  "repository": "https://github.com/deagy/agentic-sdlc",
+  "license": "Apache-2.0",
   "keywords": ["agentic-sdlc", "governance", "software-delivery", "quality-gates"],
   "skills": "./skills/",
   "interface": {

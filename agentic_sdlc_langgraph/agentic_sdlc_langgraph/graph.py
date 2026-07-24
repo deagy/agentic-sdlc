@@ -140,10 +140,48 @@ def build_graph(
 
     builder = StateGraph(SDLCState)
 
-    # --- entry: mutation-gate guard -----------------------------------
+    # --- entry: mutation-gate guard -------------------------------------
+    # A hard stop, independent of and prior to any per-gate human-approval
+    # interrupt: if `scope` matches a human-only mutation phrase, the graph
+    # interrupts *here*, before any gate's `dispatch_authors_*` node runs,
+    # and requires an explicit human authorization decision to proceed.
+    # Resuming with `{"authorized": False}` (or anything that isn't an
+    # explicit `True`) halts the run -- `run_halted` is set and the
+    # conditional edge below routes straight to END without dispatching
+    # any gate. No gate ever gets a `lifecycle_gates` entry in that case,
+    # so every included gate is structurally "pending" (see export.py,
+    # which synthesizes the pending placeholder for any in-sequence gate
+    # id absent from `lifecycle_gates`).
     def mutation_gate_check(state: SDLCState) -> dict[str, Any]:
         pending = mutation_gate_guard(state.get("scope", ""), mutation_gates)
-        return {"mutation_gate_pending": pending}
+        if not pending:
+            return {
+                "mutation_gate_pending": None,
+                "mutation_gate_decision": None,
+                "run_halted": False,
+            }
+        decision = interrupt(
+            {
+                "kind": "mutation_gate",
+                "matched": pending["matched"],
+                "reason": (
+                    "Human authorization required before any gate dispatch "
+                    "may proceed"
+                ),
+            }
+        )
+        authorized = bool(isinstance(decision, dict) and decision.get("authorized") is True)
+        decision_record = {
+            "authorized": authorized,
+            "approver": decision.get("approver") if isinstance(decision, dict) else None,
+            "reason": decision.get("reason") if isinstance(decision, dict) else None,
+            "decided_at": _now(),
+        }
+        return {
+            "mutation_gate_pending": pending,
+            "mutation_gate_decision": decision_record,
+            "run_halted": not authorized,
+        }
 
     builder.add_node("mutation_gate_check", mutation_gate_check)
     builder.add_edge(START, "mutation_gate_check")
@@ -343,11 +381,12 @@ def build_graph(
         return f"dispatch_authors_{gate_id}"
 
     has_dependent: set[str] = set()
+    root_gate_ids: list[str] = []
     for gate in gates:
         gate_id = gate["id"]
         prerequisites = [p for p in gate.get("prerequisites", []) if p in gate_ids]
         if not prerequisites:
-            builder.add_edge("mutation_gate_check", entry_node(gate_id))
+            root_gate_ids.append(gate_id)
         for prereq in prerequisites:
             builder.add_edge(exit_node(prereq), entry_node(gate_id))
             has_dependent.add(prereq)
@@ -355,5 +394,25 @@ def build_graph(
     for gate_id in gate_ids:
         if gate_id not in has_dependent:
             builder.add_edge(exit_node(gate_id), END)
+
+    # Conditional edge out of the mutation-gate guard: a halted run
+    # (unauthorized/rejected mutation-gate match) goes straight to END
+    # without dispatching any gate; otherwise fan out to every root gate
+    # (a gate with no in-sequence prerequisites) exactly as a plain edge
+    # would have, for every gate list this module has ever been built
+    # with (root_gate_ids has exactly one entry -- G1 -- for the full
+    # G1-G10 chain, but nothing here assumes that).
+    def mutation_gate_router(state: SDLCState):
+        if state.get("run_halted"):
+            return END
+        if not root_gate_ids:
+            return END
+        return [entry_node(gid) for gid in root_gate_ids]
+
+    builder.add_conditional_edges(
+        "mutation_gate_check",
+        mutation_gate_router,
+        [entry_node(gid) for gid in root_gate_ids] + [END],
+    )
 
     return builder.compile(checkpointer=checkpointer)

@@ -153,5 +153,21 @@ class SDLCState(TypedDict):
     agent_outputs: Annotated[list[dict[str, Any]], operator.add]
 
     # populated by the mutation-gate guard at graph entry; independent of
-    # gate/authority approval status.
+    # gate/authority approval status. Non-None whenever a human-only
+    # mutation phrase matched `scope` (regardless of whether it was
+    # subsequently authorized) -- see graph.py's `mutation_gate_check`.
     mutation_gate_pending: dict[str, Any] | None
+
+    # the human's authorization decision for `mutation_gate_pending`, once
+    # made (None if no mutation gate matched, or a match hasn't been
+    # resolved yet -- though in practice `mutation_gate_check` always
+    # resolves this via `interrupt()` in the same node invocation that
+    # sets `mutation_gate_pending`).
+    mutation_gate_decision: dict[str, Any] | None
+
+    # top-level hard-stop indicator: True iff a mutation-gate phrase
+    # matched and the human explicitly rejected (or never authorized)
+    # proceeding. While True, no gate dispatch node ever runs -- the graph
+    # routes straight to END from `mutation_gate_check`. This is
+    # independent of, and precedes, any per-gate human-approval interrupt.
+    run_halted: bool

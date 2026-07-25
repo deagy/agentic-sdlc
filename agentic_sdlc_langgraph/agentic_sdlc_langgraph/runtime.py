@@ -91,8 +91,9 @@ from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
 
-from .agents import AnthropicModelClient, FakeModelClient, ModelClient
+from .agents import AnthropicModelClient, DispatchingModelClient, FakeModelClient, ModelClient
 from .contracts import (
     load_agent_catalog,
     load_lifecycle_gates,
@@ -153,16 +154,26 @@ def task_exists(root: str | Path, task_id: str) -> bool:
     return _graph_config_path(Path(root).resolve(), task_id).is_file()
 
 
-def default_model_client() -> ModelClient:
+def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelClient:
     """Resolve the default `ModelClient` for `build_graph_for_task`.
 
     Returns a `FakeModelClient` (deterministic, no network) when the
     `AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL` environment variable is set to
     `"1"`; otherwise a real `AnthropicModelClient`. See module docstring.
+
+    If `agent_catalog` has any entry with `transport: "a2a"`, the
+    resolved client is wrapped in a `DispatchingModelClient` so those
+    agents are dispatched to their external `endpoint` instead of the
+    local client -- every other agent (and the zero-A2A-agents case)
+    behaves exactly as before.
     """
     if os.environ.get(FAKE_MODEL_ENV_VAR) == "1":
-        return FakeModelClient()
-    return AnthropicModelClient()
+        base: ModelClient = FakeModelClient()
+    else:
+        base = AnthropicModelClient()
+    if agent_catalog and any(entry.get("transport") == "a2a" for entry in agent_catalog.values()):
+        return DispatchingModelClient(default=base, agent_catalog=agent_catalog)
+    return base
 
 
 def default_checkpointer(root: Path) -> SqliteSaver:
@@ -350,7 +361,7 @@ def build_graph_for_task(
                 "provider's routing changed since this task was planned?"
             )
 
-    resolved_model_client = model_client if model_client is not None else default_model_client()
+    resolved_model_client = model_client if model_client is not None else default_model_client(agent_catalog)
     resolved_checkpointer = checkpointer if checkpointer is not None else default_checkpointer(root)
 
     graph = build_graph(
@@ -410,6 +421,55 @@ def invoke_result_payload(result: dict[str, Any]) -> dict[str, Any]:
     if interrupts:
         return {"status": "interrupted", "interrupt": interrupts[0].value}
     return {"status": "complete", "message": "no interrupt, run complete"}
+
+
+def create_or_reconnect_task(
+    task_id: str,
+    task: str,
+    root: Path,
+    *,
+    profile: str = "generic",
+    ignored_gate_ids: list[str] | None = None,
+    provider_manifest: str | None = None,
+) -> dict[str, Any]:
+    """Plan (or reconnect to) a task: shared by `service.py`'s
+    `POST /tasks` route and `a2a/server.py`'s `message/send` handler so
+    both entrypoints call `build_graph_for_task`/`invoke_result_payload`
+    exactly once, the same way. Raises `GraphConfigError` on a config
+    conflict/staleness -- callers translate that into their own
+    surface's error shape (HTTP 409 for the REST route, a JSON-RPC error
+    for A2A)."""
+    already_planned = task_exists(root, task_id)
+    graph, config, metadata = build_graph_for_task(
+        root,
+        task_id,
+        task_text=task,
+        profile_id=profile,
+        provider_manifest=provider_manifest,
+        ignored_gate_ids=ignored_gate_ids or [],
+    )
+    if already_planned:
+        return {"status": "already-planned", "gate_sequence": metadata.gate_sequence_ids}
+    result = graph.invoke(initial_state(task_id, task), config=config)
+    return invoke_result_payload(result)
+
+
+def resume_task_at(task_id: str, root: Path, decision: Any) -> dict[str, Any]:
+    """Resume an interrupted task with a decision: shared by `service.py`'s
+    `POST /tasks/{task_id}/resume` route and `a2a/server.py`'s
+    `message/send` (continuation) handler. Raises `GraphConfigError` for
+    an unknown `task_id`."""
+    graph, config, _metadata = build_graph_for_task(root, task_id)
+    result = graph.invoke(Command(resume=decision), config=config)
+    return invoke_result_payload(result)
+
+
+def task_status_at(task_id: str, root: Path) -> dict[str, Any]:
+    """Status summary for a task: shared by `service.py`'s
+    `GET /tasks/{task_id}` route and `a2a/server.py`'s `tasks/get`
+    handler. Raises `GraphConfigError` for an unknown `task_id`."""
+    graph, config, metadata = build_graph_for_task(root, task_id)
+    return status_summary(graph, config, metadata)
 
 
 def status_summary(graph: Any, config: dict[str, Any], metadata: TaskGraphMetadata) -> dict[str, Any]:

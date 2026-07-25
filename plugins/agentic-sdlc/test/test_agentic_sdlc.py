@@ -123,5 +123,95 @@ class V03MigrationTests(unittest.TestCase):
             agentic_sdlc.select_github_review(reviews, "reviewer", "abc")
 
 
+class AgentCatalogSchemaTests(unittest.TestCase):
+    """Validates `agent-catalog.schema.json`'s `transport`/`endpoint`
+    extension (added for A2A protocol support): both fields are optional
+    (so existing catalogs, e.g. `providers/agentic-sdlc-defaults`'s, need
+    no changes), but `transport: "a2a"` requires `endpoint`, and
+    `additionalProperties: false` still rejects unknown fields.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import jsonschema  # type: ignore
+
+        cls.jsonschema = jsonschema
+        schema_path = PLUGIN_ROOT / "contracts" / "agent-catalog.schema.json"
+        cls.schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        cls.validator = jsonschema.Draft202012Validator(cls.schema)
+
+    def assert_valid(self, catalog):
+        errors = list(self.validator.iter_errors(catalog))
+        self.assertEqual([], errors, [error.message for error in errors])
+
+    def assert_invalid(self, catalog):
+        errors = list(self.validator.iter_errors(catalog))
+        self.assertNotEqual([], errors)
+
+    def test_default_provider_catalog_is_unaffected_by_the_new_optional_fields(self):
+        default_provider_catalog = (
+            PLUGIN_ROOT.parents[1] / "providers" / "agentic-sdlc-defaults" / "agent-catalog.json"
+        )
+        catalog = json.loads(default_provider_catalog.read_text(encoding="utf-8"))
+        self.assert_valid(catalog)
+
+    def test_local_transport_entry_without_endpoint_is_valid(self):
+        self.assert_valid(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "local-author": {
+                        "kind": "author",
+                        "capabilities": ["author"],
+                        "transport": "local",
+                    }
+                },
+            }
+        )
+
+    def test_a2a_transport_entry_with_endpoint_is_valid(self):
+        self.assert_valid(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "external-reviewer": {
+                        "kind": "reviewer",
+                        "capabilities": ["reviewer"],
+                        "transport": "a2a",
+                        "endpoint": "https://codex-agent.example.com",
+                    }
+                },
+            }
+        )
+
+    def test_a2a_transport_entry_missing_endpoint_is_invalid(self):
+        self.assert_invalid(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "external-reviewer": {
+                        "kind": "reviewer",
+                        "capabilities": ["reviewer"],
+                        "transport": "a2a",
+                    }
+                },
+            }
+        )
+
+    def test_unknown_agent_field_is_still_rejected(self):
+        self.assert_invalid(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "typo-agent": {
+                        "kind": "author",
+                        "capabilities": ["author"],
+                        "trasnport": "local",
+                    }
+                },
+            }
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

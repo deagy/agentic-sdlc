@@ -292,6 +292,117 @@ class AnthropicModelClient:
         )
 
 
+@dataclass
+class A2AModelClient:
+    """Dispatches `.complete()` to one external, A2A-reachable agent
+    (e.g. a Codex CLI agent) over `message/send`, translating the
+    returned `Task` back into an `AgentOutput` of the same shape
+    `AnthropicModelClient.complete` builds.
+
+    Deliberately synchronous, single-shot (`message/send`, not
+    `message/stream`): `ModelClient.complete` is called from inside
+    `make_agent_node`'s `node(payload)` closure, which runs synchronously
+    as one LangGraph node and has no way to consume a streamed partial
+    result anyway -- streaming is only exposed on the A2A *server* side
+    (`a2a/server.py`), for external callers watching this engine's own
+    gates progress. If the external agent's task ends in
+    `input-required`, that's surfaced as a `blocking_question` rather
+    than treated as an error, matching how a human-in-the-loop author
+    reports "I can't decide this" today.
+    """
+
+    endpoint: str
+    client: Any = None  # A2AClient, lazily constructed if not supplied
+
+    def _a2a_client(self):
+        from .a2a.client import A2AClient  # local import: avoid a hard dependency for callers that never use A2A
+
+        if self.client is None:
+            self.client = A2AClient(self.endpoint)
+        return self.client
+
+    def complete(
+        self,
+        *,
+        agent_id: str,
+        kind: str,
+        gate_id: str,
+        role_prompt: str,
+        task_text: str,
+    ) -> AgentOutput:
+        task = self._a2a_client().send_message(f"{role_prompt}\n\n{task_text}")
+        digest_filler = "0" * 64
+        blocking_question = None
+        if task.status.state.value == "input-required":
+            message = task.status.message
+            blocking_question = (
+                message if isinstance(message, str) else f"{agent_id} needs clarification before proceeding"
+            )
+        return AgentOutput(
+            agent_id=agent_id,
+            kind=kind,
+            gate_id=gate_id,
+            identity=Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent"),
+            artifact_binding=ArtifactBinding(
+                artifact_id=f"{gate_id}-{agent_id}-artifact",
+                revision="rev-1",
+                digest=f"sha256:{digest_filler}",
+            ),
+            evidence_ref=EvidenceRef(
+                evidence_id=f"{gate_id}-{agent_id}-evidence",
+                uri=f"a2a://{self.endpoint}/{task.id}",
+                hash_algorithm="sha256",
+                hash=digest_filler,
+                classification="internal",
+            ),
+            blocking_question=blocking_question,
+        )
+
+
+@dataclass
+class DispatchingModelClient:
+    """Routes `.complete()` to a per-`agent_id` `ModelClient` based on the
+    agent catalog's `transport` field: `transport: "a2a"` entries go to an
+    `A2AModelClient` built from the entry's `endpoint`; everything else
+    (including agents absent from the catalog) goes to `default`.
+
+    This is the one place the local-vs-external decision is made. It
+    exists so `graph.py`'s `build_graph`/`make_agent_node` -- which take
+    exactly one shared `model_client` for every node -- need no changes
+    at all to support a mix of local and external agents.
+    """
+
+    default: ModelClient
+    agent_catalog: dict[str, Any] = field(default_factory=dict)
+    _a2a_clients: dict[str, A2AModelClient] = field(default_factory=dict, repr=False)
+
+    def _client_for(self, agent_id: str) -> ModelClient:
+        entry = self.agent_catalog.get(agent_id, {})
+        if entry.get("transport") != "a2a":
+            return self.default
+        endpoint = entry["endpoint"]
+        if agent_id not in self._a2a_clients:
+            self._a2a_clients[agent_id] = A2AModelClient(endpoint=endpoint)
+        return self._a2a_clients[agent_id]
+
+    def complete(
+        self,
+        *,
+        agent_id: str,
+        kind: str,
+        gate_id: str,
+        role_prompt: str,
+        task_text: str,
+    ) -> AgentOutput:
+        return self._client_for(agent_id).complete(
+            agent_id=agent_id,
+            kind=kind,
+            gate_id=gate_id,
+            role_prompt=role_prompt,
+            task_text=task_text,
+        )
+
+
 def make_agent_node(
     agent_id: str,
     kind: str,

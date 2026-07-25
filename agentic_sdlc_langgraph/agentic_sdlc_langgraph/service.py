@@ -27,12 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from langgraph.types import Command
 from pydantic import BaseModel
 
 from . import runtime
+from .a2a.server import router as a2a_router
 
 app = FastAPI(title="Agentic SDLC LangGraph Service")
+app.include_router(a2a_router)
 
 
 class CreateTaskRequest(BaseModel):
@@ -51,54 +52,30 @@ class ResumeRequest(BaseModel):
 
 @app.post("/tasks")
 def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
-    """Plan (or reconnect to) a task, matching the CLI's `plan` behavior:
-    first call for `task_id` derives the gate sequence, builds the graph,
-    writes `graph-config.json`, and invokes the graph to its first
-    interrupt (or completion); a later call for an already-planned
-    `task_id` is a no-op that reports its recorded gate sequence instead
-    of re-invoking.
-    """
-    root = Path(payload.root)
-    already_planned = runtime.task_exists(root, payload.task_id)
     try:
-        graph, config, metadata = runtime.build_graph_for_task(
-            root,
+        return runtime.create_or_reconnect_task(
             payload.task_id,
-            task_text=payload.task,
-            profile_id=payload.profile,
-            provider_manifest=payload.provider_manifest,
+            payload.task,
+            Path(payload.root),
+            profile=payload.profile,
             ignored_gate_ids=payload.ignored_gate_ids,
+            provider_manifest=payload.provider_manifest,
         )
     except runtime.GraphConfigError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    if already_planned:
-        return {"status": "already-planned", "gate_sequence": metadata.gate_sequence_ids}
-
-    result = graph.invoke(runtime.initial_state(payload.task_id, payload.task), config=config)
-    return runtime.invoke_result_payload(result)
-
 
 @app.post("/tasks/{task_id}/resume")
 def resume_task(task_id: str, payload: ResumeRequest) -> dict[str, Any]:
-    """Resume an interrupted task with a decision, matching the CLI's
-    `resume` behavior."""
-    root = Path(payload.root)
     try:
-        graph, config, _metadata = runtime.build_graph_for_task(root, task_id)
+        return runtime.resume_task_at(task_id, Path(payload.root), payload.decision)
     except runtime.GraphConfigError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    result = graph.invoke(Command(resume=payload.decision), config=config)
-    return runtime.invoke_result_payload(result)
 
 
 @app.get("/tasks/{task_id}")
 def get_task_status(task_id: str, root: str) -> dict[str, Any]:
-    """Status summary, matching the CLI's `status` behavior."""
     try:
-        graph, config, metadata = runtime.build_graph_for_task(Path(root), task_id)
+        return runtime.task_status_at(task_id, Path(root))
     except runtime.GraphConfigError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    return runtime.status_summary(graph, config, metadata)

@@ -1,9 +1,13 @@
+import argparse
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -162,6 +166,188 @@ class PortableCliTests(unittest.TestCase):
         self.run_cli("init", "--profile", "quick")
         plan = self.run_cli("plan", "--task-id", "QUICK-2", "--task", "Prepare a production deployment for the backend API")
         self.assertIn("production-deployment", [gate["id"] for gate in plan["human_gates"]])
+
+    def test_run_batches_multiple_human_gates_into_one_decision_packet(self):
+        self.run_cli("init", "--profile", "quick")
+        result = self.run_cli(
+            "run",
+            "--task-id",
+            "RUN-1",
+            "--task",
+            "Please deploy to production, perform a persistent migration, and make a privileged identity change.",
+            expected=2,
+        )
+        self.assertEqual("waiting-for-human", result["status"])
+        self.assertEqual(
+            ["production-deployment", "persistent-migration", "privileged-identity-change"],
+            [question["id"] for question in result["questions"]],
+        )
+        packet_path = self.root / ".agentic-sdlc" / "runs" / "RUN-1" / "decision-packets" / f"{result['packet_id']}.json"
+        checkpoint_path = self.root / ".agentic-sdlc" / "runs" / "RUN-1" / "checkpoints" / f"{agentic_sdlc.thread_key(result['thread_id'])}.json"
+        self.assertTrue(packet_path.is_file())
+        self.assertTrue(checkpoint_path.is_file())
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        self.assertIn(packet["runtime_backend"], {"langgraph", "file-checkpoint"})
+        self.assertEqual(1, packet["wave"])
+        self.assertEqual(3, len(packet["questions"]))
+
+    def test_resume_updates_the_consolidated_decision_packet(self):
+        self.run_cli("init", "--profile", "quick")
+        created = self.run_cli(
+            "run",
+            "--task-id",
+            "RUN-2",
+            "--task",
+            "Please deploy to production and perform a persistent migration.",
+            expected=2,
+        )
+        response = {
+            "production-deployment": {"decision": "acknowledged", "actor": "release-owner"},
+            "persistent-migration": {"decision": "acknowledged", "actor": "release-owner"},
+        }
+        resumed = self.run_cli(
+            "resume",
+            "--task-id",
+            "RUN-2",
+            "--thread-id",
+            created["thread_id"],
+            "--response-json",
+            json.dumps(response),
+        )
+        self.assertIn("packet", resumed)
+        packet_path = self.root / ".agentic-sdlc" / "runs" / "RUN-2" / "decision-packets" / f"{created['packet_id']}.json"
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        self.assertEqual("responses-recorded", packet["status"])
+        self.assertEqual(response, packet["responses"])
+        self.assertEqual(sorted(response), packet["completed_question_ids"])
+        record = self.load(".agentic-sdlc/runs/RUN-2/run-record.json")
+        self.assertFalse(any(gate["human_approvals"] for gate in record["lifecycle_gates"]))
+
+    def test_resume_rejects_a_noncanonical_langgraph_thread(self):
+        self.run_cli("init", "--profile", "quick")
+        self.run_cli(
+            "run",
+            "--task-id",
+            "RUN-THREAD",
+            "--task",
+            "Please deploy to production.",
+            expected=2,
+        )
+        result = self.run_cli(
+            "resume",
+            "--task-id",
+            "RUN-THREAD",
+            "--thread-id",
+            "another-thread",
+            "--response-json",
+            json.dumps({"production-deployment": {"decision": "acknowledged"}}),
+            expected=1,
+        )
+        self.assertIn("thread ID must match", result["error"])
+
+    def run_fallback(self, task_id, task):
+        output = io.StringIO()
+        with mock.patch.object(agentic_sdlc, "LANGGRAPH_AVAILABLE", False), contextlib.redirect_stdout(output):
+            exit_code = agentic_sdlc.run_task(
+                argparse.Namespace(root=str(self.root), task_id=task_id, task=task)
+            )
+        self.assertEqual(2, exit_code)
+        return json.loads(output.getvalue())
+
+    def resume_fallback(self, task_id, response, expected=0):
+        output = io.StringIO()
+        with mock.patch.object(agentic_sdlc, "LANGGRAPH_AVAILABLE", False), contextlib.redirect_stdout(output):
+            if expected:
+                with self.assertRaisesRegex(ValueError, expected):
+                    agentic_sdlc.resume_task(
+                        argparse.Namespace(
+                            root=str(self.root),
+                            task_id=task_id,
+                            thread_id=task_id,
+                            response_json=json.dumps(response),
+                        )
+                    )
+                return None
+            exit_code = agentic_sdlc.resume_task(
+                argparse.Namespace(
+                    root=str(self.root),
+                    task_id=task_id,
+                    thread_id=task_id,
+                    response_json=json.dumps(response),
+                )
+            )
+        self.assertEqual(0, exit_code)
+        return json.loads(output.getvalue())
+
+    def test_fallback_resume_records_only_exact_pending_responses(self):
+        self.run_cli("init", "--profile", "quick")
+        created = self.run_fallback(
+            "FALLBACK-1",
+            "Please deploy to production and perform a persistent migration.",
+        )
+        response = {
+            "production-deployment": {"decision": "acknowledged"},
+            "persistent-migration": {"decision": "acknowledged"},
+        }
+        resumed = self.resume_fallback("FALLBACK-1", response)
+        self.assertEqual("responses-recorded", resumed["status"])
+        packet = self.load(
+            f".agentic-sdlc/runs/FALLBACK-1/decision-packets/{created['packet_id']}.json"
+        )
+        self.assertEqual("responses-recorded", packet["status"])
+        self.assertEqual(response, packet["responses"])
+        record = self.load(".agentic-sdlc/runs/FALLBACK-1/run-record.json")
+        self.assertFalse(any(gate["human_approvals"] for gate in record["lifecycle_gates"]))
+
+    def test_fallback_resume_rejects_missing_or_unexpected_questions(self):
+        self.run_cli("init", "--profile", "quick")
+        self.run_fallback(
+            "FALLBACK-2",
+            "Please deploy to production and perform a persistent migration.",
+        )
+        self.resume_fallback(
+            "FALLBACK-2",
+            {"production-deployment": {"decision": "acknowledged"}},
+            expected="exactly the pending",
+        )
+        self.resume_fallback(
+            "FALLBACK-2",
+            {
+                "production-deployment": {"decision": "acknowledged"},
+                "persistent-migration": {"decision": "acknowledged"},
+                "unexpected": {"decision": "acknowledged"},
+            },
+            expected="exactly the pending",
+        )
+
+    def test_fallback_resume_rejects_tampered_checkpoint_packet_path(self):
+        self.run_cli("init", "--profile", "quick")
+        self.run_fallback("FALLBACK-3", "Please deploy to production.")
+        checkpoint_path = self.root / ".agentic-sdlc" / "runs" / "FALLBACK-3" / "checkpoints" / f"{agentic_sdlc.thread_key('FALLBACK-3')}.json"
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        outside = self.root / "outside.json"
+        outside.write_text(json.dumps({"untouched": True}), encoding="utf-8")
+        checkpoint["packet_path"] = str(outside)
+        checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+        self.resume_fallback(
+            "FALLBACK-3",
+            {"production-deployment": {"decision": "acknowledged"}},
+            expected="packet_path does not match",
+        )
+        self.assertEqual({"untouched": True}, json.loads(outside.read_text(encoding="utf-8")))
+
+    def test_validate_rejects_tampered_runtime_checkpoint(self):
+        self.run_cli("init", "--profile", "quick")
+        self.run_fallback("FALLBACK-4", "Please deploy to production.")
+        checkpoint_path = self.root / ".agentic-sdlc" / "runs" / "FALLBACK-4" / "checkpoints" / f"{agentic_sdlc.thread_key('FALLBACK-4')}.json"
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        checkpoint["packet_path"] = str(self.root / "outside.json")
+        checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+        result = self.run_cli("validate", expected=1)
+        self.assertTrue(
+            any("invalid runtime decision packet" in error for error in result["errors"]),
+            result,
+        )
 
     def test_runner_flag_selects_which_wrapper_set_is_generated(self):
         self.run_cli("init", "--profile", "quick", "--runner", "claude")

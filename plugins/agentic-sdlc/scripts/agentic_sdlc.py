@@ -11,9 +11,12 @@ import os
 import re
 import subprocess
 import sys
+import sqlite3
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 
 VERSION = "0.2.0"
@@ -26,6 +29,8 @@ EXTENSIONS_SEARCH_PATH = [EXTENSIONS]
 AGENT_CATALOG_SEARCH_PATH = [CONTRACTS / "agent-catalog.json"]
 LOADED_PROVIDERS: list[dict[str, Any]] = []
 OVERLAY = ".agentic-sdlc"
+DECISION_PACKET_DIR = "decision-packets"
+CHECKPOINT_DIR = "checkpoints"
 GATE_IDS = [f"G{number}" for number in range(1, 11)]
 REQUIRED_AUTHORITY_ROLES = {
     "product_owner": ["G1", "G2", "G6"],
@@ -61,6 +66,19 @@ GITHUB_REVIEW_URI = re.compile(
     r"^github-review:(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+):"
     r"pull/(?P<pull>[0-9]+):review/(?P<review>[0-9]+):reviewer/(?P<login>[A-Za-z0-9-]+)$"
 )
+
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
+    from langgraph.graph import END, START, StateGraph  # type: ignore
+    from langgraph.types import Command, interrupt  # type: ignore
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    SqliteSaver = None  # type: ignore[assignment]
+    StateGraph = None  # type: ignore[assignment]
+    Command = None  # type: ignore[assignment]
+    interrupt = None  # type: ignore[assignment]
+else:
+    LANGGRAPH_AVAILABLE = True
 
 
 def now() -> str:
@@ -479,6 +497,47 @@ def safe_task_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) or value in {".", ".."}:
         raise ValueError("task ID must already be a portable, non-lossy ID using only letters, numbers, dot, underscore, or hyphen")
     return value
+
+
+def thread_key(thread_id: str) -> str:
+    cleaned = thread_id.strip()
+    if not cleaned:
+        raise ValueError("thread ID must be non-empty")
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
+def decision_packet_id(task_id: str, dispatch_hash: str, wave_index: int) -> str:
+    digest = dispatch_hash.removeprefix("sha256:")
+    return f"{task_id}-wave-{wave_index}-{digest[:16]}"
+
+
+def decision_packet_path(root: Path, task_id: str, packet_id: str) -> Path:
+    return confined_path(root, OVERLAY, "runs", task_id, DECISION_PACKET_DIR, f"{packet_id}.json")
+
+
+def checkpoint_path(root: Path, task_id: str, thread_id: str) -> Path:
+    return confined_path(root, OVERLAY, "runs", task_id, CHECKPOINT_DIR, f"{thread_key(thread_id)}.json")
+
+
+class RuntimeState(TypedDict, total=False):
+    root: str
+    task_id: str
+    task: str
+    dispatch: dict[str, Any]
+    record: dict[str, Any]
+    packet: dict[str, Any]
+    response: dict[str, Any]
+
+
+def runtime_checkpointer(root: Path, task_id: str):
+    db_path = confined_path(root, OVERLAY, "runs", task_id, CHECKPOINT_DIR, "langgraph.sqlite")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path, check_same_thread=False)
+    saver = SqliteSaver(connection)
+    setup = getattr(saver, "setup", None)
+    if callable(setup):
+        setup()
+    return saver
 
 
 def detect_repository(root: Path) -> dict[str, Any]:
@@ -1037,6 +1096,270 @@ def plan_task(args: argparse.Namespace) -> int:
     return 0
 
 
+def human_gate_questions(dispatch: dict[str, Any], record: dict[str, Any]) -> list[dict[str, Any]]:
+    gates_by_id = {gate["gate_id"]: gate for gate in record.get("lifecycle_gates", [])}
+    questions: list[dict[str, Any]] = []
+    for gate in sorted(dispatch.get("human_gates", []), key=lambda item: gate_index(item["id"]) if item["id"] in GATE_IDS else len(GATE_IDS)):
+        gate_id = gate["id"]
+        gate_record = gates_by_id.get(gate_id, {})
+        required_roles = [
+            requirement["role"]
+            for requirement in gate_record.get("authority_requirements", [])
+            if requirement.get("authority_type") == "human-approver"
+        ]
+        questions.append(
+            {
+                "id": gate_id,
+                "wave": 1,
+                "title": f"Review {gate_id}",
+                "reason": gate.get("reason"),
+                "required_roles": required_roles,
+                "applicability": gate_record.get("applicability", "unknown"),
+                "applicability_rationale": gate_record.get("applicability_rationale"),
+                "artifact_bindings": gate_record.get("artifact_bindings", []),
+                "evidence_refs": gate_record.get("evidence_refs", []),
+                "required_reentry_gate": gate_record.get("required_reentry_gate"),
+            }
+        )
+    return questions
+
+
+def build_decision_packet(
+    root: Path,
+    task_id: str,
+    dispatch: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    questions = human_gate_questions(dispatch, record)
+    dispatch_hash = dispatch["dispatch_fingerprint"]
+    thread_id = task_id
+    packet_id = decision_packet_id(task_id, dispatch_hash, 1)
+    packet = {
+        "schema_version": 1,
+        "packet_id": packet_id,
+        "thread_id": thread_id,
+        "task_id": task_id,
+        "dispatch_fingerprint": dispatch_hash,
+        "generated_at": now(),
+        "runtime_backend": "langgraph" if LANGGRAPH_AVAILABLE else "file-checkpoint",
+        "wave": 1,
+        "status": "waiting-for-human" if questions else "ready",
+        "questions": questions,
+        "summary": {
+            "workflow": dispatch.get("workflow"),
+            "matched_routes": dispatch.get("matched_routes", []),
+            "required_quality_gates": [gate.get("id") for gate in dispatch.get("required_quality_gates", [])],
+            "human_gates": [gate.get("id") for gate in dispatch.get("human_gates", [])],
+        },
+    }
+    packet_path = decision_packet_path(root, task_id, packet_id)
+    checkpoint = {
+        "task_id": task_id,
+        "thread_id": thread_id,
+        "packet_id": packet_id,
+        "packet_path": str(packet_path),
+        "dispatch_path": str(confined_path(root, OVERLAY, "runs", task_id, "dispatch-plan.json")),
+        "record_path": str(confined_path(root, OVERLAY, "runs", task_id, "run-record.json")),
+        "dispatch_fingerprint": dispatch_hash,
+        "questions": [question["id"] for question in questions],
+        "status": packet["status"],
+        "created_at": packet["generated_at"],
+    }
+    write_json(packet_path, packet)
+    write_json(checkpoint_path(root, task_id, thread_id), checkpoint)
+    return packet
+
+
+def load_runtime_packet(root: Path, task_id: str, thread_id: str) -> tuple[dict[str, Any], dict[str, Any], Path, Path]:
+    """Load a runtime packet only from its canonical, confined locations."""
+    checkpoint_file = checkpoint_path(root, task_id, thread_id)
+    checkpoint = load_json(checkpoint_file)
+    dispatch = load_json(confined_path(root, OVERLAY, "runs", task_id, "dispatch-plan.json"))
+    dispatch_fingerprint = dispatch.get("dispatch_fingerprint")
+    if not isinstance(dispatch_fingerprint, str) or not dispatch_fingerprint:
+        raise ValueError("dispatch plan is missing its fingerprint")
+    packet_id = decision_packet_id(task_id, dispatch_fingerprint, 1)
+    packet_file = decision_packet_path(root, task_id, packet_id)
+    expected_checkpoint = {
+        "task_id": task_id,
+        "thread_id": thread_id,
+        "packet_id": packet_id,
+        "packet_path": str(packet_file),
+        "dispatch_fingerprint": dispatch_fingerprint,
+    }
+    for field, expected in expected_checkpoint.items():
+        if checkpoint.get(field) != expected:
+            raise ValueError(f"checkpoint {field} does not match the authoritative runtime identity")
+    packet = load_json(packet_file)
+    expected_packet = {
+        "task_id": task_id,
+        "thread_id": thread_id,
+        "packet_id": packet_id,
+        "dispatch_fingerprint": dispatch_fingerprint,
+        "wave": 1,
+    }
+    for field, expected in expected_packet.items():
+        if packet.get(field) != expected:
+            raise ValueError(f"decision packet {field} does not match the authoritative runtime identity")
+    return checkpoint, packet, checkpoint_file, packet_file
+
+
+def validate_runtime_response(packet: dict[str, Any], response: Any, *, require_waiting: bool) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        raise ValueError("human response must be a JSON object")
+    if require_waiting and packet.get("status") != "waiting-for-human":
+        raise ValueError("decision packet is not waiting for human responses")
+    questions = packet.get("questions")
+    if not isinstance(questions, list):
+        raise ValueError("decision packet questions must be a list")
+    question_ids = [question.get("id") for question in questions if isinstance(question, dict)]
+    if len(question_ids) != len(questions) or any(not isinstance(question_id, str) or not question_id for question_id in question_ids):
+        raise ValueError("decision packet has invalid question IDs")
+    if len(set(question_ids)) != len(question_ids):
+        raise ValueError("decision packet has duplicate question IDs")
+    if set(response) != set(question_ids):
+        raise ValueError("response-json must contain exactly the pending decision packet question IDs")
+    return response
+
+
+def record_runtime_responses(root: Path, task_id: str, thread_id: str, response: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    checkpoint, packet, checkpoint_file, packet_file = load_runtime_packet(root, task_id, thread_id)
+    responses = validate_runtime_response(packet, response, require_waiting=True)
+    recorded_at = now()
+    packet["status"] = "responses-recorded"
+    packet["responses_recorded_at"] = recorded_at
+    packet["responses"] = responses
+    packet["completed_question_ids"] = sorted(responses)
+    checkpoint["status"] = packet["status"]
+    checkpoint["responses_recorded_at"] = recorded_at
+    checkpoint["responses"] = responses
+    write_json(packet_file, packet)
+    write_json(checkpoint_file, checkpoint)
+    return checkpoint, packet
+
+
+def validate_runtime_artifacts(root: Path, task_id: str, errors: list[str]) -> None:
+    packet_directory = confined_path(root, OVERLAY, "runs", task_id, DECISION_PACKET_DIR)
+    checkpoint_directory = confined_path(root, OVERLAY, "runs", task_id, CHECKPOINT_DIR)
+    if not packet_directory.exists() and not checkpoint_directory.exists():
+        return
+    if not packet_directory.exists() or not checkpoint_directory.exists():
+        errors.append(f"{task_id}: runtime packet and checkpoint directories must both exist")
+        return
+    try:
+        checkpoint, packet, _, _ = load_runtime_packet(root, task_id, task_id)
+        status = packet.get("status")
+        if status not in {"waiting-for-human", "ready", "responses-recorded"}:
+            raise ValueError("decision packet has an invalid status")
+        if checkpoint.get("status") != status:
+            raise ValueError("checkpoint status does not match decision packet status")
+        questions = packet.get("questions")
+        if not isinstance(questions, list) or any(
+            not isinstance(question, dict)
+            or not isinstance(question.get("id"), str)
+            or not question["id"]
+            for question in questions
+        ):
+            raise ValueError("decision packet has invalid question IDs")
+        expected_questions = [question["id"] for question in questions]
+        if checkpoint.get("questions") != expected_questions:
+            raise ValueError("checkpoint questions do not match decision packet questions")
+        if status == "responses-recorded":
+            responses = validate_runtime_response(packet, packet.get("responses"), require_waiting=False)
+            if checkpoint.get("responses") != responses:
+                raise ValueError("checkpoint responses do not match decision packet responses")
+        elif "responses" in packet or "responses" in checkpoint:
+            raise ValueError("unrecorded decision packet must not contain responses")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        errors.append(f"{task_id}: invalid runtime decision packet: {error}")
+
+
+def prepare_runtime_artifacts(root: Path, task_id: str, task: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    with redirect_stdout(StringIO()):
+        plan_task(argparse.Namespace(root=str(root), task_id=task_id, task=task))
+    dispatch = load_json(confined_path(root, OVERLAY, "runs", task_id, "dispatch-plan.json"))
+    record = load_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"))
+    return dispatch, record
+
+
+def build_runtime_graph(root: Path, task_id: str):
+    if not LANGGRAPH_AVAILABLE:
+        return None
+
+    def prepare_node(state: RuntimeState) -> RuntimeState:
+        dispatch, record = prepare_runtime_artifacts(root, task_id, state["task"])
+        packet = build_decision_packet(root, task_id, dispatch, record)
+        return {"dispatch": dispatch, "record": record, "packet": packet}
+
+    def human_review_node(state: RuntimeState) -> RuntimeState:
+        _, packet, _, _ = load_runtime_packet(root, task_id, task_id)
+        if not packet.get("questions"):
+            return {"packet": packet}
+        response = interrupt(packet)
+        _, packet = record_runtime_responses(
+            root, task_id, task_id, response
+        )
+        return {"packet": packet, "response": response}
+
+    builder = StateGraph(RuntimeState)
+    builder.add_node("prepare", prepare_node)
+    builder.add_node("human_review", human_review_node)
+    builder.add_edge(START, "prepare")
+    builder.add_edge("prepare", "human_review")
+    builder.add_edge("human_review", END)
+    saver = runtime_checkpointer(root, task_id)
+    return builder.compile(checkpointer=saver)
+
+
+def run_task(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    graph = build_runtime_graph(root, task_id)
+    if graph is None:
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            plan_task(args)
+        dispatch = load_json(confined_path(root, OVERLAY, "runs", task_id, "dispatch-plan.json"))
+        record = load_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"))
+        packet = build_decision_packet(root, task_id, dispatch, record)
+        print(json.dumps(packet, indent=2))
+        return 2 if packet["status"] == "waiting-for-human" else 0
+    result = graph.invoke(
+        {"root": str(root), "task_id": task_id, "task": args.task},
+        {"configurable": {"thread_id": task_id}},
+    )
+    _, packet, _, _ = load_runtime_packet(root, task_id, task_id)
+    if isinstance(result, dict) and "__interrupt__" in result:
+        print(json.dumps(packet, indent=2))
+        return 2
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def resume_task(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    thread_id = args.thread_id.strip()
+    if not thread_id:
+        raise ValueError("thread ID must be non-empty")
+    if thread_id != task_id:
+        raise ValueError("thread ID must match the task ID for this runtime")
+    response = json.loads(args.response_json)
+    _, packet, _, _ = load_runtime_packet(root, task_id, thread_id)
+    validate_runtime_response(packet, response, require_waiting=True)
+    graph = build_runtime_graph(root, task_id)
+    if graph is None:
+        _, packet = record_runtime_responses(root, task_id, thread_id, response)
+        print(json.dumps({"task_id": task_id, "thread_id": thread_id, "status": packet["status"], "packet": packet}, indent=2))
+        return 0
+    result = graph.invoke(
+        Command(resume=response),
+        {"configurable": {"thread_id": thread_id}},
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def valid_exception(exception: dict[str, Any]) -> bool:
     required = {"exception_id", "finding_id", "justification", "compensating_controls", "owner", "approver", "expires_at", "remediation_plan"}
     if not required.issubset(exception) or not exception.get("compensating_controls"):
@@ -1160,6 +1483,7 @@ def validate_repository(args: argparse.Namespace) -> int:
         except (OSError, ValueError, json.JSONDecodeError) as error:
             errors.append(str(error))
             continue
+        validate_runtime_artifacts(root, task_directory.name, errors)
         required_top = {"version", "task_id", "dispatch_fingerprint", "recorded_at", "classification", "mode", "baseline_revision", "scope", "disposition", "intent_record_id", "requirements_baseline_id", "current_lifecycle_phase", "knowledge_retrieval", "impact_profile", "lifecycle_gates", "specialist_attestations", "re_entry_history"}
         missing_top = required_top.difference(record)
         if missing_top:
@@ -1594,6 +1918,17 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--task-id", required=True)
     plan.add_argument("--task", required=True)
     plan.set_defaults(handler=plan_task)
+    run = subparsers.add_parser("run", help="Create a plan and pause at a consolidated human decision packet")
+    run.add_argument("--root", default=".")
+    run.add_argument("--task-id", required=True)
+    run.add_argument("--task", required=True)
+    run.set_defaults(handler=run_task)
+    resume = subparsers.add_parser("resume", help="Resume a consolidated human decision packet")
+    resume.add_argument("--root", default=".")
+    resume.add_argument("--task-id", required=True)
+    resume.add_argument("--thread-id", required=True)
+    resume.add_argument("--response-json", required=True, help="JSON object mapping question ids to responses")
+    resume.set_defaults(handler=resume_task)
     validate = subparsers.add_parser("validate", help="Validate configuration and fail closed on unresolved decisions")
     validate.add_argument("--root", default=".")
     validate.set_defaults(handler=validate_repository)

@@ -142,6 +142,8 @@ The bundled command entry point is `plugins/agentic-sdlc/scripts/agentic_sdlc.py
 init        Create or update a project overlay using safe defaults.
 detect      Inspect a repository and report candidate project characteristics.
 plan        Produce a reviewable dispatch plan for a task.
+run         Produce a dispatch plan and consolidated human decision packet.
+resume      Record validated responses to a consolidated human decision packet.
 validate    Validate the overlay and lifecycle records.
 status      Report lifecycle and gate state for a task.
 approve-from-github  Record a human lifecycle approval from a GitHub PR review.
@@ -261,6 +263,10 @@ Keep lifecycle state in version control according to the project's evidence-clas
 - It cannot identify human authorities, legal obligations, risk acceptance, evidence-retention policy, or production authorization.
 - The portable validator fails closed unless `requirements-validation.txt` is installed. With it, validation enforces lifecycle safety semantics and exhaustive Draft 2020-12 structural and format validation against the bundled schemas; CI enables this mode.
 - The plugin prepares and validates decision records but does not authenticate an approver's real-world identity; projects must reference evidence from their authoritative approval system.
+- `run` writes a single consolidated human-decision packet and project-owned checkpoint files so one dependency wave can be reviewed at a time instead of prompting gate-by-gate.
+- `resume` accepts only the exact pending question IDs and records responses as non-authoritative input; it neither approves nor advances lifecycle gates. Projects must use the authoritative approval-evidence workflow for that.
+- The runtime path is LangGraph-compatible when that dependency is installed, and falls back to the same checkpointed packet flow when it is not.
+- Install `plugins/agentic-sdlc/requirements-runtime.txt` to enable the LangGraph-backed runtime path and SQLite checkpointing.
 - It does not deploy, apply infrastructure, run persistent migrations, accept risk, merge, or approve gates.
 - Project-specific agent wrappers, knowledge-store integrations, CI wiring, and organization-specific impact extensions may require an overlay customization.
 - Specialized SQS/BOM semantics remain unavailable until an authorized owner supplies definitions and applicability.

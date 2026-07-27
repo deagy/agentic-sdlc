@@ -69,12 +69,18 @@ GITHUB_REVIEW_URI = re.compile(
 # GitLab MR approval-evidence adapter (RG-1). SPECULATIVE / not currently required: this was
 # built on a mistaken premise that the consuming Secure Cloud provider's source control was
 # GitLab (team-profile.yaml actually declares GitHub for source_control/approvals -- GitLab is
-# only used for CI/CD there, which the existing GitHub adapter above already covers). Kept,
-# uncommitted, as an optional future capability rather than discarded, since the code itself is
+# only used for CI/CD there, which the existing GitHub adapter above already covers). It ships
+# as a real, callable CLI surface (approve-from-gitlab / approve-from-gitlab-mr, visible in
+# --help) rather than being dead/disabled code -- "speculative" describes why it was built, not
+# whether it is reachable, so do not assume it needs activating before it can be used or
+# misused. Kept as an optional capability rather than discarded, since the code itself is
 # correct and tested. Per product-owner amendment, this provides the same trust level as the
 # GitHub adapter above -- a trusted API attestation read from GitLab's own approval state, not
 # independent non-repudiation/signing. Per the data-minimization amendment, only the approver's
-# pseudonymous username is ever persisted (never name/email/avatar).
+# pseudonymous username is ever persisted (never name/email/avatar). Only gitlab.com identities
+# (`gitlab.com/<user>`) are recognized by convention-based binding; a self-hosted GitLab instance
+# requires the explicit `gitlab_username` authority field, since the platform this adapter was
+# built against is itself self-hosted and gitlab.com may not be the actual instance in use.
 GITLAB_MR_URI = re.compile(
     r"^gitlab-mr:(?P<project_path>[A-Za-z0-9_./-]+):merge_requests/(?P<iid>\d+):"
     r"approval/(?P<approval_id>[^:]+):approver/(?P<username>[A-Za-z0-9_.-]+)$"
@@ -388,7 +394,31 @@ def gitlab_approval_records_from_api_response(raw: Any) -> list[dict[str, Any]]:
             # reflects whether the overall approval-rule threshold has been
             # met). Do not conflate the two: a user who has approved but is
             # still waiting on other approvers must still show "approved"
-            # here; gate/threshold sufficiency is decided elsewhere.
+            # here; gate/threshold sufficiency is decided elsewhere. `state`
+            # is therefore always "approved" for every real GitLab response --
+            # GitLab's approvals API has no per-user pending/rejected value,
+            # unlike GitHub's per-review state. The {"approved","active"}
+            # check in select_gitlab_approval() below and any non-"approved"
+            # state are unreachable from real data; they exist only for
+            # forward compatibility / parity with the GitHub adapter's shape.
+            #
+            # `decided_at` is the MR-level `updated_at`, not a genuine
+            # per-approver timestamp -- GitLab's approvals endpoint does not
+            # expose one. `updated_at` changes on any MR update (a later
+            # commit push, description edit, another approver acting), so it
+            # can misrepresent exactly when this specific approver decided.
+            # Evidence consumers should treat this as an approximation, not
+            # a precise decision time.
+            #
+            # `commit_sha` is likewise the MR-level `sha`, applied uniformly
+            # to every approver. GitLab's approvals endpoint does not expose
+            # a per-approval "commit reviewed" field the way GitHub's
+            # per-review `commit_id` does. Correctness of `--commit-sha`
+            # filtering in approve-from-gitlab-mr depends on the GitLab
+            # project having "reset approvals on push" enabled; otherwise a
+            # stale approval against an old commit could remain in
+            # `approved_by` and be attributed to the current head SHA. This
+            # precondition is not verified by this adapter.
             records.append({
                 "approval_id": str(user_id) if user_id is not None else username,
                 "username": username,
@@ -1105,6 +1135,7 @@ def initialize(args: argparse.Namespace) -> int:
         ("commands.json", commands),
     ]
     lock_path = overlay / "version.lock"
+    agents_md_path = confined_path(root, "AGENTS.md")
     if dry_run:
         would_create: list[str] = []
         existing_unchanged: list[str] = []
@@ -1115,6 +1146,11 @@ def initialize(args: argparse.Namespace) -> int:
         wrappers_would_create, wrappers_existing = (
             write_agent_wrappers(root, profile, args.runner, dry_run=True) if profile_id else ([], [])
         )
+        # update_agents_md() runs unconditionally on every real init (it creates
+        # AGENTS.md if absent, or replaces its managed block in place if present),
+        # so a faithful preview must report its effect even though dry-run never
+        # calls it.
+        agents_md_status = "would_create" if not agents_md_path.exists() else "would_update_managed_block"
         print(json.dumps({
             "status": "dry-run",
             "mutation": False,
@@ -1124,6 +1160,7 @@ def initialize(args: argparse.Namespace) -> int:
             "existing_unchanged": existing_unchanged,
             "agent_wrappers_would_create": wrappers_would_create,
             "agent_wrappers_existing": wrappers_existing,
+            "agents_md": agents_md_status,
             "detected": detected,
         }, indent=2))
         return 0
@@ -1150,9 +1187,10 @@ def initialize(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         created.append(f"{OVERLAY}/version.lock")
+    agents_md_status = "created" if not agents_md_path.exists() else "updated_managed_block"
     update_agents_md(root)
     wrappers, _wrappers_existing = write_agent_wrappers(root, profile, args.runner) if profile_id else ([], [])
-    print(json.dumps({"status": "initialized", "root": str(root), "profile": profile_id, "created": created, "agent_wrappers_created": wrappers, "ready": False, "blockers": ["Human authorities and impact applicability require explicit decisions."]}, indent=2))
+    print(json.dumps({"status": "initialized", "root": str(root), "profile": profile_id, "created": created, "agent_wrappers_created": wrappers, "agents_md": agents_md_status, "ready": False, "blockers": ["Human authorities and impact applicability require explicit decisions."]}, indent=2))
     return 0
 
 

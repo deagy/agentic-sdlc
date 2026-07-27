@@ -154,6 +154,7 @@ class V03MigrationTests(unittest.TestCase):
         self.assertTrue(result["agent_wrappers_would_create"])
         self.assertEqual([], result["agent_wrappers_existing"])
         self.assertIn("detected", result)
+        self.assertEqual("would_create", result["agents_md"])
         after = tree_hash(self.root)
         self.assertEqual(before, after)
         self.assertFalse((self.root / ".agentic-sdlc").exists())
@@ -171,8 +172,18 @@ class V03MigrationTests(unittest.TestCase):
         self.assertIn(".agentic-sdlc/version.lock", result["existing_unchanged"])
         self.assertEqual([], result["agent_wrappers_would_create"])
         self.assertTrue(result["agent_wrappers_existing"])
+        # update_agents_md() always rewrites the managed block on a real init,
+        # even when AGENTS.md already exists -- dry-run must not claim it's
+        # unchanged just because the file is present.
+        self.assertEqual("would_update_managed_block", result["agents_md"])
         after = tree_hash(self.root)
         self.assertEqual(before, after)
+
+    def test_init_real_run_reports_agents_md_created_then_updated(self):
+        first = self.run_cli("init", "--profile", "generic", provider=True)
+        self.assertEqual("created", first["agents_md"])
+        second = self.run_cli("init", "--profile", "generic", provider=True)
+        self.assertEqual("updated_managed_block", second["agents_md"])
 
     def test_init_dry_run_rejects_combination_with_force(self):
         result = subprocess.run(

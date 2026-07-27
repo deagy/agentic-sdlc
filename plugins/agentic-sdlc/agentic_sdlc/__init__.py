@@ -856,15 +856,22 @@ def record_gitlab_issue_link(
         "state": issue["state"],
         "web_url": issue.get("web_url"),
     }
-    evidence_id = f"{gate_id.lower()}-source-gitlab-issue-{issue_iid}"
+    evidence_id_prefix = f"{gate_id.lower()}-source-gitlab-issue-"
     evidence_entry = {
-        "evidence_id": evidence_id,
+        "evidence_id": f"{evidence_id_prefix}{issue_iid}",
         "uri": issue_uri,
         "hash_algorithm": "sha256",
         "hash": fingerprint(evidence_payload).removeprefix("sha256:"),
         "classification": record.get("classification", project.get("classification", "internal")),
     }
-    remaining = [item for item in gate.get("evidence_refs", []) if item.get("evidence_id") != evidence_id]
+    # Filter by prefix, not exact evidence_id: record[record_field] holds
+    # exactly one URI at a time, so relinking a *different* issue must
+    # still replace (not accumulate alongside) the prior source-link
+    # evidence for this gate, not just an exact re-link of the same issue.
+    remaining = [
+        item for item in gate.get("evidence_refs", [])
+        if not str(item.get("evidence_id", "")).startswith(evidence_id_prefix)
+    ]
     remaining.append(evidence_entry)
     gate["evidence_refs"] = remaining
     record[record_field] = issue_uri
@@ -2147,6 +2154,14 @@ def reenter(args: argparse.Namespace) -> int:
         gate["evidence_refs"] = []
         gate["human_approvals"] = []
         gate["decided_at"] = None
+        # A gate-level source link (record_gitlab_issue_link) sets both
+        # gate["evidence_refs"] and record[record_field] as a pair; clearing
+        # evidence_refs above without also clearing the paired top-level
+        # field here would leave intent_record_id/requirements_baseline_id
+        # pointing at now-deleted evidence.
+        record_field = RECORD_FIELD_BY_GATE.get(gate["gate_id"])
+        if record_field is not None:
+            record[record_field] = None
     advance_lifecycle(record, load_overlay(root)[4])
     record.setdefault("re_entry_history", []).append({
         "invalidated_at": now(), "actor": args.actor, "reason": args.reason,

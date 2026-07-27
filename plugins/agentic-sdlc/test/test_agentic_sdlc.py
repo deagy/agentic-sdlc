@@ -629,6 +629,75 @@ class V03MigrationTests(unittest.TestCase):
         self.assertEqual(gate_before["status"], gate_after["status"])
         self.assertEqual([], gate_after["human_approvals"])
 
+    def test_source_link_evidence_alone_can_never_satisfy_can_mark_gate_approved(self):
+        # Regression pin for a design risk raised in review: can_mark_gate_approved
+        # requires non-empty artifact_bindings/evidence_refs *and*
+        # has_all_required_human_approvals(...). record_gitlab_issue_link never
+        # touches human_approvals, so even in a hypothetical future where some
+        # other code path populates artifact_bindings for G1/G2 (it never does
+        # today), a gate whose only evidence is a source link -- no real human
+        # approval -- must still be unapprovable. Constructs the gate directly
+        # (not via the full CLI flow) specifically to isolate this from today's
+        # incidental protection (artifact_bindings staying perpetually empty).
+        authorities = {"product_owner": {"status": "assigned", "assignee": "github.com/owner"}}
+        gate = {
+            "gate_id": "G1",
+            "status": "ready",
+            "applicability": "applicable",
+            "artifact_bindings": [{"artifact_id": "a", "revision": "1", "digest": "sha256:00"}],
+            "evidence_refs": [{
+                "evidence_id": "g1-source-gitlab-issue-42",
+                "uri": "gitlab-issue:group/project:issues/42",
+                "hash_algorithm": "sha256",
+                "hash": "00",
+                "classification": "internal",
+            }],
+            "independent_verifier": {"id": "reviewer", "role": "Reviewer", "kind": "human"},
+            "independence_declaration": {"verifier_confirmed_not_preparer": True, "verifier_made_material_correction": False},
+            "authority_requirements": [
+                {"authority_id": "product_owner", "authority_type": "human-approver", "role": "Product Owner", "applicability": "applicable", "rationale": None}
+            ],
+            "human_approvals": [],
+        }
+        record = {"lifecycle_gates": [gate]}
+        self.assertFalse(agentic_sdlc.can_mark_gate_approved(record, gate, authorities))
+
+    def test_relinking_a_different_issue_replaces_rather_than_accumulates_evidence(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-8", "--task", "Create the service architecture", provider=True)
+        self._link_from_gitlab_issue(
+            "link-intent-from-gitlab-issue", task_id="GI-8", role="product_owner", issue_iid=42
+        )
+        self._link_from_gitlab_issue(
+            "link-intent-from-gitlab-issue", task_id="GI-8", role="product_owner", issue_iid=99
+        )
+        record = self.load(".agentic-sdlc/runs/GI-8/run-record.json")
+        self.assertEqual("gitlab-issue:group/project:issues/99", record["intent_record_id"])
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual(1, len(gate["evidence_refs"]))
+        self.assertEqual("gitlab-issue:group/project:issues/99", gate["evidence_refs"][0]["uri"])
+
+    def test_reenter_clears_the_paired_source_link_field_along_with_its_evidence(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-9", "--task", "Create the service architecture", provider=True)
+        self._link_from_gitlab_issue("link-intent-from-gitlab-issue", task_id="GI-9", role="product_owner")
+        record = self.load(".agentic-sdlc/runs/GI-9/run-record.json")
+        self.assertIsNotNone(record["intent_record_id"])
+        self.run_cli(
+            "invalidate", "--task-id", "GI-9", "--earliest-gate", "G1",
+            "--reason", "Intent changed", "--actor", "product-owner",
+        )
+        self.run_cli(
+            "reenter", "--task-id", "GI-9", "--earliest-gate", "G1",
+            "--reason", "Intent changed", "--actor", "product-owner",
+        )
+        record = self.load(".agentic-sdlc/runs/GI-9/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual([], gate["evidence_refs"])
+        self.assertIsNone(record["intent_record_id"])
+
     def test_validate_flags_malformed_gitlab_issue_uri(self):
         self.run_cli("init", "--profile", "generic", provider=True)
         self._assign_authority("product_owner")

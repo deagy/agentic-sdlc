@@ -61,7 +61,7 @@ Initialization creates or manages this target-repository structure:
 AGENTS.md                      # Small managed Agentic SDLC instruction block
 ```
 
-`init --runner {codex,claude,both}` (default `both`) controls which wrapper set is generated; both are safe to keep even if only one runner is in active use. Existing custom agent wrapper files are not overwritten. Use `init --force` only after reviewing its help: it refreshes managed overlay files and can replace project decisions stored in those managed files.
+`init --runner {codex,claude,both}` (default `both`) controls which wrapper set is generated; both are safe to keep even if only one runner is in active use. Existing custom agent wrapper files are never overwritten, and existing managed overlay files (`.agentic-sdlc/project.json`, `authorities.json`, `impact-profile.json`, `routing.json`, `commands.json`) are never overwritten either. In the current release, `--force` does not change this: `init`, with or without `--force`, is non-destructive and idempotent with respect to already-written wrapper and overlay files. Do not rely on `--force` to refresh managed files or intentionally replace prior project decisions; always check `init --help` for the installed version's actual behavior before assuming otherwise.
 
 ## Safe defaults
 

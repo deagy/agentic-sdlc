@@ -14,16 +14,17 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 import agentic_sdlc  # type: ignore
 
 # Every subprocess invocation below exercises the checked-out package via
-# `-m` (the same invocation bin/agentic-sdlc uses), not an installed
-# `agentic-sdlc` distribution -- PYTHONPATH must carry PLUGIN_ROOT since a
-# subprocess doesn't inherit this test process's sys.path.insert() above.
-CLI_COMMAND = [sys.executable, "-m", "agentic_sdlc"]
+# dev_entrypoint.py -- the same entry point bin/agentic-sdlc uses, and
+# deliberately not `python3 -m agentic_sdlc`/an installed `agentic-sdlc`
+# distribution, since `-m` would put this test process's cwd (not
+# PLUGIN_ROOT) at sys.path[0] in the subprocess; dev_entrypoint.py sets its
+# own sys.path from its own file location instead, so no PYTHONPATH
+# threading is needed here (see that file's docstring).
+CLI_COMMAND = [sys.executable, str(PLUGIN_ROOT / "dev_entrypoint.py")]
 
 
 def cli_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
-    merged = {**os.environ, **(overrides or {})}
-    merged["PYTHONPATH"] = os.pathsep.join(filter(None, [str(PLUGIN_ROOT), merged.get("PYTHONPATH")]))
-    return merged
+    return {**os.environ, **(overrides or {})}
 
 
 def tree_hash(root: Path) -> str:
@@ -475,6 +476,35 @@ class V03MigrationTests(unittest.TestCase):
             any("invalid GitLab MR approval URI" in error for error in result["errors"]),
             result["errors"],
         )
+
+
+class DevEntrypointCwdIsolationTests(unittest.TestCase):
+    """dev_entrypoint.py must resolve the real kernel package regardless of
+    what the caller's own current working directory contains -- this is
+    exactly the failure mode a `python3 -m agentic_sdlc` invocation would
+    have (its cwd lands at sys.path[0], ahead of any PYTHONPATH-prepended
+    entry), which dev_entrypoint.py avoids by putting its own file location
+    at sys.path[0] instead (see that file's docstring)."""
+
+    def test_a_colliding_top_level_module_in_the_callers_cwd_is_not_shadowed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = Path(temporary)
+            # A decoy that would break everything if it were ever imported
+            # instead of the real kernel package.
+            (cwd / "agentic_sdlc.py").write_text(
+                "raise RuntimeError('the decoy module was imported instead of the real package')\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                CLI_COMMAND + ["--version"],
+                cwd=cwd,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=cli_env(),
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(agentic_sdlc.VERSION, result.stdout.strip())
 
 
 class AgentCatalogSchemaTests(unittest.TestCase):

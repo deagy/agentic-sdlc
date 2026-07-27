@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Portable G1-G10 Agentic SDLC lifecycle kernel: bootstrap, plan, and validate a project overlay."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
     "jsonschema[format]==4.26.0",
 ]
@@ -24,6 +24,10 @@ path = "agentic_sdlc/__init__.py"
 pattern = "VERSION = \"(?P<version>[^\"]+)\""
 
 [tool.hatch.build.targets.wheel]
+# dev_entrypoint.py (sibling to this file, used only by bin/agentic-sdlc and
+# the test suite for running the checkout in place) is deliberately not
+# listed here or in the sdist include list below, so it never ships in the
+# installed/pipx distribution.
 packages = ["agentic_sdlc"]
 
 # contracts/ stays a single source of truth at plugins/agentic-sdlc/contracts/

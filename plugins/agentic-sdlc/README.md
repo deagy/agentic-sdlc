@@ -101,7 +101,7 @@ agent catalog, and optional extensions through a versioned manifest:
 ```json
 {
   "schema_version": 1,
-  "id": "secure-cloud-agents",
+  "id": "agentic-sdlc-defaults",
   "version": "0.3.0",
   "kernel_compatibility": {
     "minimum": "0.3.0",
@@ -112,6 +112,8 @@ agent catalog, and optional extensions through a versioned manifest:
   "extension_roots": ["extensions"]
 }
 ```
+
+(Illustrative shape, based on `providers/agentic-sdlc-defaults/provider.json`, the reference provider this repository ships — that file's own `extension_roots`/`dependencies` differ slightly since it declares no extensions. Any external provider, such as the one `deagy/agents` supplies, follows the same manifest shape with its own `id`.)
 
 Load providers explicitly before the subcommand:
 

@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from . import runtime
 from .a2a.server import router as a2a_router
+from .gitlab_issue import resolve_issue_reference
 
 app = FastAPI(title="Agentic SDLC LangGraph Service")
 app.include_router(a2a_router)
@@ -43,6 +44,12 @@ class CreateTaskRequest(BaseModel):
     profile: str = "generic"
     ignored_gate_ids: list[str] = []
     provider_manifest: str | None = None
+    # <project-path>#<iid> form, e.g. "group/project#42"; resolved to a
+    # validated gitlab-issue:... URI in create_task below. See
+    # gitlab_issue.py and cli.py's plan --intent-gitlab-issue for the same
+    # capability on the CLI surface.
+    intent_gitlab_issue: str | None = None
+    requirements_gitlab_issue: str | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -53,6 +60,11 @@ class ResumeRequest(BaseModel):
 @app.post("/tasks")
 def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
     try:
+        intent_record_id = resolve_issue_reference(payload.intent_gitlab_issue)
+        requirements_baseline_id = resolve_issue_reference(payload.requirements_gitlab_issue)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
         return runtime.create_or_reconnect_task(
             payload.task_id,
             payload.task,
@@ -60,6 +72,8 @@ def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
             profile=payload.profile,
             ignored_gate_ids=payload.ignored_gate_ids,
             provider_manifest=payload.provider_manifest,
+            intent_record_id=intent_record_id,
+            requirements_baseline_id=requirements_baseline_id,
         )
     except runtime.GraphConfigError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

@@ -105,6 +105,48 @@ def test_full_g1_g3_lifecycle_via_http(client: TestClient, tmp_path):
     assert status["re_entry_history_length"] == 0
 
 
+def test_create_task_links_gitlab_issues(client: TestClient, tmp_path, monkeypatch: pytest.MonkeyPatch, capsys):
+    import json as json_module
+
+    from agentic_sdlc_langgraph import cli
+
+    mock_issue = {"iid": 0, "title": "Support SSO login", "state": "opened", "web_url": None, "updated_at": None}
+    mock_file = tmp_path / "issue.json"
+    mock_file.write_text(json_module.dumps(mock_issue), encoding="utf-8")
+    monkeypatch.setenv("AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE", str(mock_file))
+
+    response = client.post(
+        "/tasks",
+        json={
+            "task_id": "svc-2",
+            "task": TASK_TEXT,
+            "root": str(tmp_path),
+            "intent_gitlab_issue": "group/project#42",
+            "requirements_gitlab_issue": "group/project#43",
+        },
+    )
+    assert response.status_code == 200
+
+    code = cli.main(["export", "--root", str(tmp_path), "--task-id", "svc-2"])
+    assert code == 0
+    record = json_module.loads(capsys.readouterr().out)
+    assert record["intent_record_id"] == "gitlab-issue:group/project:issues/42"
+    assert record["requirements_baseline_id"] == "gitlab-issue:group/project:issues/43"
+
+
+def test_create_task_rejects_malformed_gitlab_issue_reference(client: TestClient, tmp_path):
+    response = client.post(
+        "/tasks",
+        json={
+            "task_id": "svc-3",
+            "task": TASK_TEXT,
+            "root": str(tmp_path),
+            "intent_gitlab_issue": "not-a-valid-reference",
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_service_and_cli_share_the_same_on_disk_state(tmp_path):
     """The service and the CLI must be interchangeable against the same
     `root`/`task_id`: plan via the service, resume via the CLI. Proves

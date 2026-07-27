@@ -238,8 +238,8 @@ def export_run_record(
         "baseline_revision": "unresolved",
         "scope": state.get("scope") or "unspecified",
         "disposition": "pending",
-        "intent_record_id": None,
-        "requirements_baseline_id": None,
+        "intent_record_id": state.get("intent_record_id"),
+        "requirements_baseline_id": state.get("requirements_baseline_id"),
         "current_lifecycle_phase": current_phase,
         "knowledge_retrieval": {
             "status": "unavailable",

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PLUGIN_ROOT.parents[1]
@@ -474,6 +475,174 @@ class V03MigrationTests(unittest.TestCase):
         result = self.run_cli("validate", provider=True, expected=1)
         self.assertTrue(
             any("invalid GitLab MR approval URI" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_parse_gitlab_issue_uri(self):
+        parsed = agentic_sdlc.parse_gitlab_issue_uri("gitlab-issue:group/project:issues/42")
+        self.assertEqual({"project_path": "group/project", "iid": "42"}, parsed)
+        self.assertIsNone(agentic_sdlc.parse_gitlab_issue_uri("gitlab-issue:missing-fields"))
+        self.assertIsNone(agentic_sdlc.parse_gitlab_issue_uri("gitlab-mr:group/project:merge_requests/42:approval/1:approver/alice"))
+
+    def test_fetch_gitlab_issue_via_mock(self):
+        mock_path = self.root / "gitlab-issue-mock.json"
+        mock_path.write_text(json.dumps({
+            "iid": 42,
+            "title": "Support SSO login for enterprise customers",
+            "state": "opened",
+            "web_url": "https://gitlab.example.com/group/project/-/issues/42",
+            "updated_at": "2030-01-01T00:00:00Z",
+        }), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE": str(mock_path)}):
+            issue = agentic_sdlc.fetch_gitlab_issue("group/project", 42)
+        self.assertEqual(
+            {
+                "iid": 42,
+                "title": "Support SSO login for enterprise customers",
+                "state": "opened",
+                "web_url": "https://gitlab.example.com/group/project/-/issues/42",
+                "updated_at": "2030-01-01T00:00:00Z",
+            },
+            issue,
+        )
+
+    def test_fetch_gitlab_issue_rejects_missing_title(self):
+        mock_path = self.root / "gitlab-issue-bad.json"
+        mock_path.write_text(json.dumps({"iid": 99, "state": "opened"}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE": str(mock_path)}):
+            with self.assertRaises(ValueError):
+                agentic_sdlc.fetch_gitlab_issue("group/project", 99)
+
+    def _assign_authority(self, role, assignee="github.com/owner"):
+        authorities_path = self.root / ".agentic-sdlc" / "authorities.json"
+        authorities = self.load(".agentic-sdlc/authorities.json")
+        authorities[role].update({"status": "assigned", "assignee": assignee, "applicability": "applicable"})
+        authorities_path.write_text(json.dumps(authorities), encoding="utf-8")
+
+    def _link_from_gitlab_issue(self, command, **overrides):
+        mock_path = self.root / "gitlab-issue-link-mock.json"
+        mock_path.write_text(json.dumps({
+            "iid": overrides.get("issue_iid", 42),
+            "title": overrides.get("title", "Support SSO login for enterprise customers"),
+            "state": overrides.get("state", "opened"),
+            "web_url": "https://gitlab.example.com/group/project/-/issues/42",
+            "updated_at": "2030-01-01T00:00:00Z",
+        }), encoding="utf-8")
+        return self.run_cli(
+            command,
+            "--task-id", overrides["task_id"],
+            "--role", overrides["role"],
+            "--project-path", overrides.get("project_path", "group/project"),
+            "--issue-iid", str(overrides.get("issue_iid", 42)),
+            expected=overrides.get("expected", 0),
+            env={"AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE": str(mock_path)},
+        )
+
+    def test_link_intent_from_gitlab_issue_records_evidence_and_sets_intent_record_id(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-1", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_gitlab_issue(
+            "link-intent-from-gitlab-issue", task_id="GI-1", role="product_owner"
+        )
+        expected_uri = "gitlab-issue:group/project:issues/42"
+        self.assertEqual(expected_uri, result["issue_uri"])
+        self.assertEqual("intent_record_id", result["record_field"])
+        record = self.load(".agentic-sdlc/runs/GI-1/run-record.json")
+        self.assertEqual(expected_uri, record["intent_record_id"])
+        self.assertIsNone(record["requirements_baseline_id"])
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        evidence = gate["evidence_refs"][0]
+        self.assertEqual(expected_uri, evidence["uri"])
+        self.assertEqual("sha256", evidence["hash_algorithm"])
+        self.assertEqual("g1-source-gitlab-issue-42", evidence["evidence_id"])
+
+    def test_link_requirements_from_gitlab_issue_records_evidence_and_sets_requirements_baseline_id(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("engineering_lead")
+        self.run_cli("plan", "--task-id", "GI-2", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_gitlab_issue(
+            "link-requirements-from-gitlab-issue", task_id="GI-2", role="engineering_lead"
+        )
+        expected_uri = "gitlab-issue:group/project:issues/42"
+        self.assertEqual("requirements_baseline_id", result["record_field"])
+        record = self.load(".agentic-sdlc/runs/GI-2/run-record.json")
+        self.assertEqual(expected_uri, record["requirements_baseline_id"])
+        self.assertIsNone(record["intent_record_id"])
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G2")
+        self.assertEqual(expected_uri, gate["evidence_refs"][0]["uri"])
+
+    def test_link_intent_rejects_unassigned_authority(self):
+        # An authority never assigned before `plan` has its gate snapshot's
+        # applicability computed as "unknown" at plan time (make_gate_record),
+        # so that check fires before reaching the separate "is not assigned"
+        # check further down -- both are rejections, just at different points
+        # for a never-assigned vs. assigned-then-unassigned-after-plan authority.
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self.run_cli("plan", "--task-id", "GI-3", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_gitlab_issue(
+            "link-intent-from-gitlab-issue", task_id="GI-3", role="product_owner", expected=1
+        )
+        self.assertIn("is not applicable", result["error"])
+
+    def test_link_intent_rejects_authority_unassigned_after_plan(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-3B", "--task", "Create the service architecture", provider=True)
+        authorities_path = self.root / ".agentic-sdlc" / "authorities.json"
+        authorities = self.load(".agentic-sdlc/authorities.json")
+        authorities["product_owner"].update({"status": "unassigned", "assignee": None})
+        authorities_path.write_text(json.dumps(authorities), encoding="utf-8")
+        result = self._link_from_gitlab_issue(
+            "link-intent-from-gitlab-issue", task_id="GI-3B", role="product_owner", expected=1
+        )
+        self.assertIn("is not assigned", result["error"])
+
+    def test_link_intent_rejects_role_not_required_by_gate(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("engineering_lead")
+        self.run_cli("plan", "--task-id", "GI-4", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_gitlab_issue(
+            "link-intent-from-gitlab-issue", task_id="GI-4", role="engineering_lead", expected=1
+        )
+        self.assertIn("does not require authority role", result["error"])
+
+    def test_link_intent_is_idempotent_on_relink(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-5", "--task", "Create the service architecture", provider=True)
+        self._link_from_gitlab_issue("link-intent-from-gitlab-issue", task_id="GI-5", role="product_owner")
+        self._link_from_gitlab_issue("link-intent-from-gitlab-issue", task_id="GI-5", role="product_owner")
+        record = self.load(".agentic-sdlc/runs/GI-5/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual(1, len(gate["evidence_refs"]))
+
+    def test_link_intent_does_not_affect_gate_approval_status(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-6", "--task", "Create the service architecture", provider=True)
+        before = self.load(".agentic-sdlc/runs/GI-6/run-record.json")
+        gate_before = next(item for item in before["lifecycle_gates"] if item["gate_id"] == "G1")
+        self._link_from_gitlab_issue("link-intent-from-gitlab-issue", task_id="GI-6", role="product_owner")
+        after = self.load(".agentic-sdlc/runs/GI-6/run-record.json")
+        gate_after = next(item for item in after["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual(gate_before["status"], gate_after["status"])
+        self.assertEqual([], gate_after["human_approvals"])
+
+    def test_validate_flags_malformed_gitlab_issue_uri(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GI-7", "--task", "Create the service architecture", provider=True)
+        self._link_from_gitlab_issue("link-intent-from-gitlab-issue", task_id="GI-7", role="product_owner")
+        record_relative = ".agentic-sdlc/runs/GI-7/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["evidence_refs"][0]["uri"] = "gitlab-issue:malformed-uri-missing-fields"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.run_cli("validate", provider=True, expected=1)
+        self.assertTrue(
+            any("invalid GitLab issue URI" in error for error in result["errors"]),
             result["errors"],
         )
 

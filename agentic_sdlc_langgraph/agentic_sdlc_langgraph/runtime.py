@@ -385,7 +385,14 @@ def build_graph_for_task(
 # --------------------------------------------------------------------------
 
 
-def initial_state(task_id: str, task_text: str, classification: str = "internal") -> dict[str, Any]:
+def initial_state(
+    task_id: str,
+    task_text: str,
+    classification: str = "internal",
+    *,
+    intent_record_id: str | None = None,
+    requirements_baseline_id: str | None = None,
+) -> dict[str, Any]:
     """The initial `SDLCState` payload for a task's first `graph.invoke`.
 
     `authorities` starts empty (no assigned authorities) -- deliberately
@@ -394,12 +401,20 @@ def initial_state(task_id: str, task_text: str, classification: str = "internal"
     authority-assignment plumbing. This is a documented simplification,
     not an oversight: neither the CLI nor the service surface a way to
     assign authorities today (see task report).
+
+    `intent_record_id`/`requirements_baseline_id` are optional, set once
+    here at plan time (typically from a GitLab issue link resolved by the
+    caller via `gitlab_issue.py` -- see `cli.py`'s `plan`) and never
+    recomputed afterward; `None` means no source was supplied, matching the
+    schema's nullable field.
     """
     return {
         "task_id": task_id,
         "classification": classification,
         "scope": task_text,
         "current_lifecycle_phase": "intent",
+        "intent_record_id": intent_record_id,
+        "requirements_baseline_id": requirements_baseline_id,
         "lifecycle_gates": {},
         "re_entry_history": [],
         "authorities": {},
@@ -431,6 +446,8 @@ def create_or_reconnect_task(
     profile: str = "generic",
     ignored_gate_ids: list[str] | None = None,
     provider_manifest: str | None = None,
+    intent_record_id: str | None = None,
+    requirements_baseline_id: str | None = None,
 ) -> dict[str, Any]:
     """Plan (or reconnect to) a task: shared by `service.py`'s
     `POST /tasks` route and `a2a/server.py`'s `message/send` handler so
@@ -438,7 +455,13 @@ def create_or_reconnect_task(
     exactly once, the same way. Raises `GraphConfigError` on a config
     conflict/staleness -- callers translate that into their own
     surface's error shape (HTTP 409 for the REST route, a JSON-RPC error
-    for A2A)."""
+    for A2A).
+
+    `intent_record_id`/`requirements_baseline_id` are passed straight
+    through to `initial_state` -- see that function's docstring; callers
+    (e.g. `service.py`'s `CreateTaskRequest`) are responsible for having
+    already resolved a GitLab issue reference (if any) to a URI via
+    `gitlab_issue.py` before calling this."""
     already_planned = task_exists(root, task_id)
     graph, config, metadata = build_graph_for_task(
         root,
@@ -450,7 +473,15 @@ def create_or_reconnect_task(
     )
     if already_planned:
         return {"status": "already-planned", "gate_sequence": metadata.gate_sequence_ids}
-    result = graph.invoke(initial_state(task_id, task), config=config)
+    result = graph.invoke(
+        initial_state(
+            task_id,
+            task,
+            intent_record_id=intent_record_id,
+            requirements_baseline_id=requirements_baseline_id,
+        ),
+        config=config,
+    )
     return invoke_result_payload(result)
 
 

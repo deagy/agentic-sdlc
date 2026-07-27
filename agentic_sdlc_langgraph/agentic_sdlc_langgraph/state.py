@@ -11,10 +11,16 @@ full list):
   `knowledge_retrieval` / `impact_profile` modeling in the live graph state
   — those are synthesized as schema-satisfying placeholders only at export
   time (`export.py`), not carried through the graph.
-- `mode`, `baseline_revision`, `disposition`, `intent_record_id`,
-  `requirements_baseline_id` (top-level run-record fields) are likewise
-  handled only at export time, not modeled as live graph state, since
-  nothing in the G1-G3 slice computes them.
+- `mode`, `baseline_revision`, `disposition` (top-level run-record fields)
+  are likewise handled only at export time, not modeled as live graph
+  state, since nothing in the G1-G3 slice computes them.
+- `intent_record_id` / `requirements_baseline_id` ARE modeled as live state
+  (see below) -- they're set once, optionally, at `plan` time from a
+  `--intent-gitlab-issue`/`--requirements-gitlab-issue` argument (see
+  `gitlab_issue.py`, `cli.py`'s `plan`), then read back unchanged at export
+  time. No node ever recomputes them after planning; unlike the
+  `Annotated[..., reducer]` fields below, a plain field here is correct
+  because nothing but the initial state ever sets it.
 """
 
 from __future__ import annotations
@@ -161,6 +167,12 @@ class SDLCState(TypedDict):
     classification: str
     scope: str  # the task text; also what routing/mutation-gate matching reads
     current_lifecycle_phase: str
+
+    # optional, set once at plan time from --intent-gitlab-issue /
+    # --requirements-gitlab-issue (see gitlab_issue.py); None if not supplied.
+    # Never approval evidence -- gate approval status is unaffected by these.
+    intent_record_id: str | None
+    requirements_baseline_id: str | None
 
     lifecycle_gates: Annotated[dict[str, GateState], merge_gate_updates]
 

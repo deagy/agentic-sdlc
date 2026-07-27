@@ -101,6 +101,16 @@ GITLAB_MR_URI = re.compile(
     r"^gitlab-mr:(?P<project_path>[A-Za-z0-9_./-]+):merge_requests/(?P<iid>\d+):"
     r"approval/(?P<approval_id>[^:]+):approver/(?P<username>[A-Za-z0-9_.-]+)$"
 )
+# GitLab issue linkage for G1 Intent / G2 Requirements Baseline. Deliberately
+# NOT an approval-evidence adapter: linking a GitLab issue as a gate's source
+# never marks that gate approved, and gate approval (the human_approval_{gate}
+# interrupt / approve-from-* commands above) is unaffected by whether a
+# source is linked. This is why there is no "approver" concept in the URI
+# below (unlike GITHUB_REVIEW_URI/GITLAB_MR_URI) -- an issue link records
+# where the intent/requirements content came from, not who signed off on it.
+GITLAB_ISSUE_URI = re.compile(
+    r"^gitlab-issue:(?P<project_path>[A-Za-z0-9_./-]+):issues/(?P<iid>\d+)$"
+)
 
 
 def now() -> str:
@@ -500,6 +510,50 @@ def select_gitlab_approval(
     return latest
 
 
+def parse_gitlab_issue_uri(value: str) -> dict[str, str] | None:
+    match = GITLAB_ISSUE_URI.fullmatch(value)
+    if not match:
+        return None
+    return match.groupdict()
+
+
+def fetch_gitlab_issue(project_path: str, issue_iid: int) -> dict[str, Any]:
+    """Fetch a single GitLab issue's linkable fields. No author/assignee
+    identity is ever read here -- an issue link has no approver concept
+    (unlike the MR approval adapter), so there is nothing to minimize away;
+    only the fields needed to identify and reference the issue are kept."""
+    mock_path = os.environ.get("AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE")
+    if mock_path:
+        raw_response = json.loads(Path(mock_path).read_text(encoding="utf-8"))
+    else:
+        encoded_project = quote(project_path, safe="")
+        result = subprocess.run(
+            ["glab", "api", f"projects/{encoded_project}/issues/{issue_iid}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown glab api failure"
+            raise ValueError(f"unable to fetch GitLab issue for {project_path} issue {issue_iid}: {detail}")
+        raw_response = json.loads(result.stdout)
+    if not isinstance(raw_response, dict):
+        raise ValueError("GitLab issue API response must be a JSON object")
+    title = raw_response.get("title")
+    state = raw_response.get("state")
+    if not isinstance(title, str) or not title:
+        raise ValueError(f"GitLab issue {project_path}#{issue_iid} response is missing a title")
+    if state not in {"opened", "closed"}:
+        raise ValueError(f"GitLab issue {project_path}#{issue_iid} response has an unrecognized state: {state!r}")
+    return {
+        "iid": issue_iid,
+        "title": title,
+        "state": state,
+        "web_url": raw_response.get("web_url"),
+        "updated_at": raw_response.get("updated_at"),
+    }
+
+
 def human_requirement_for_gate(gate: dict[str, Any], authority_id: str) -> dict[str, Any] | None:
     for requirement in gate.get("authority_requirements", []):
         if requirement.get("authority_type") == "human-approver" and requirement.get("authority_id") == authority_id:
@@ -749,6 +803,79 @@ def record_gitlab_approval(
         "approval_uri": approval_uri,
         "gate_status": gate.get("status"),
         "current_phase": derive_current_phase(record),
+    }
+
+
+RECORD_FIELD_BY_GATE = {"G1": "intent_record_id", "G2": "requirements_baseline_id"}
+
+
+def record_gitlab_issue_link(
+    root: Path,
+    task_id: str,
+    gate_id: str,
+    authority_role: str,
+    project_path: str,
+    issue: dict[str, Any],
+) -> dict[str, Any]:
+    """Link a GitLab issue as the recorded source for a G1/G2 gate's
+    contribution. Deliberately does not touch human_approvals or gate
+    status -- a source link is not an approval; see GITLAB_ISSUE_URI's
+    module-level comment. Authorization mirrors the approval adapters
+    (only an assigned, applicable authority for the gate may attach a
+    link), but nothing here can mark a gate approved."""
+    record_field = RECORD_FIELD_BY_GATE.get(gate_id)
+    if record_field is None:
+        raise ValueError(f"gate {gate_id} does not accept a GitLab issue source link")
+    _, project, authorities, _, _ = load_overlay(root)
+    path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
+    record = load_json(path)
+    gate = next((item for item in record.get("lifecycle_gates", []) if item.get("gate_id") == gate_id), None)
+    if gate is None:
+        raise ValueError(f"unknown gate in run record: {gate_id}")
+    authority = authorities.get(authority_role)
+    if not isinstance(authority, dict):
+        raise ValueError(f"unknown authority role: {authority_role}")
+    requirement = human_requirement_for_gate(gate, authority_role)
+    if requirement is None:
+        raise ValueError(f"{gate_id} does not require authority role {authority_role}")
+    if requirement.get("applicability") != "applicable":
+        raise ValueError(f"{gate_id} authority role {authority_role} is not applicable")
+    if authority.get("status") != "assigned" or not authority.get("assignee"):
+        raise ValueError(f"authority {authority_role} is not assigned")
+    issue_iid = issue["iid"]
+    issue_uri = f"gitlab-issue:{project_path}:issues/{issue_iid}"
+    if parse_gitlab_issue_uri(issue_uri) is None:
+        raise ValueError(f"invalid GitLab issue URI components for {issue_uri}")
+    evidence_payload = {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "project_path": project_path,
+        "issue_iid": issue_iid,
+        "title": issue["title"],
+        "state": issue["state"],
+        "web_url": issue.get("web_url"),
+    }
+    evidence_id = f"{gate_id.lower()}-source-gitlab-issue-{issue_iid}"
+    evidence_entry = {
+        "evidence_id": evidence_id,
+        "uri": issue_uri,
+        "hash_algorithm": "sha256",
+        "hash": fingerprint(evidence_payload).removeprefix("sha256:"),
+        "classification": record.get("classification", project.get("classification", "internal")),
+    }
+    remaining = [item for item in gate.get("evidence_refs", []) if item.get("evidence_id") != evidence_id]
+    remaining.append(evidence_entry)
+    gate["evidence_refs"] = remaining
+    record[record_field] = issue_uri
+    write_json(path, record)
+    return {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "record_field": record_field,
+        "issue_uri": issue_uri,
+        "issue_title": issue["title"],
+        "issue_state": issue["state"],
     }
 
 
@@ -1655,6 +1782,13 @@ def validate_repository(args: argparse.Namespace) -> int:
         invalidation_started = False
         for index, gate in enumerate(gate_records):
             gate_id = gate.get("gate_id")
+            for evidence in gate.get("evidence_refs", []):
+                if not isinstance(evidence, dict):
+                    errors.append(f"{record_path}: {gate_id} evidence_refs contains a non-object entry")
+                    continue
+                uri = evidence.get("uri")
+                if isinstance(uri, str) and uri.startswith("gitlab-issue:") and parse_gitlab_issue_uri(uri) is None:
+                    errors.append(f"{record_path}: {gate_id} has an invalid GitLab issue URI")
             contract = gate_contracts.get(gate_id, {})
             execution = execution_gates.get(gate_id)
             if execution is None:
@@ -2159,6 +2293,24 @@ def approve_from_gitlab_mr(args: argparse.Namespace) -> int:
     return 0
 
 
+def link_intent_from_gitlab_issue(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    issue = fetch_gitlab_issue(args.project_path, args.issue_iid)
+    result = record_gitlab_issue_link(root, task_id, "G1", args.role, args.project_path, issue)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def link_requirements_from_gitlab_issue(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    issue = fetch_gitlab_issue(args.project_path, args.issue_iid)
+    result = record_gitlab_issue_link(root, task_id, "G2", args.role, args.project_path, issue)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def provider_introspection(args: argparse.Namespace) -> int:
     if args.resource_kind == "provider":
         if args.action == "list":
@@ -2256,6 +2408,20 @@ def build_parser() -> argparse.ArgumentParser:
     approve_gitlab_auto.add_argument("--approver-username", help="GitLab username to match; defaults to the authority GitLab binding")
     approve_gitlab_auto.add_argument("--commit-sha", help="Optional commit SHA to require when selecting an approved approval")
     approve_gitlab_auto.set_defaults(handler=approve_from_gitlab_mr)
+    link_intent = subparsers.add_parser("link-intent-from-gitlab-issue", help="Link a GitLab issue as the recorded source for G1 Intent")
+    link_intent.add_argument("--root", default=".")
+    link_intent.add_argument("--task-id", required=True)
+    link_intent.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True, help="Authority role recording the link")
+    link_intent.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
+    link_intent.add_argument("--issue-iid", type=int, required=True, help="Issue internal ID (iid)")
+    link_intent.set_defaults(handler=link_intent_from_gitlab_issue)
+    link_requirements = subparsers.add_parser("link-requirements-from-gitlab-issue", help="Link a GitLab issue as the recorded source for G2 Requirements Baseline")
+    link_requirements.add_argument("--root", default=".")
+    link_requirements.add_argument("--task-id", required=True)
+    link_requirements.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True, help="Authority role recording the link")
+    link_requirements.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
+    link_requirements.add_argument("--issue-iid", type=int, required=True, help="Issue internal ID (iid)")
+    link_requirements.set_defaults(handler=link_requirements_from_gitlab_issue)
     invalid = subparsers.add_parser("invalidate", help="Invalidate the earliest affected gate and all downstream gates")
     invalid.add_argument("--root", default=".")
     invalid.add_argument("--task-id", required=True)

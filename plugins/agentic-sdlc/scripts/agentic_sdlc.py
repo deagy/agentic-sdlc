@@ -14,6 +14,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 VERSION = "0.3.0"
@@ -64,6 +65,19 @@ MANAGED_END = "<!-- agentic-sdlc:end -->"
 GITHUB_REVIEW_URI = re.compile(
     r"^github-review:(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+):"
     r"pull/(?P<pull>[0-9]+):review/(?P<review>[0-9]+):reviewer/(?P<login>[A-Za-z0-9-]+)$"
+)
+# GitLab MR approval-evidence adapter (RG-1). SPECULATIVE / not currently required: this was
+# built on a mistaken premise that the consuming Secure Cloud provider's source control was
+# GitLab (team-profile.yaml actually declares GitHub for source_control/approvals -- GitLab is
+# only used for CI/CD there, which the existing GitHub adapter above already covers). Kept,
+# uncommitted, as an optional future capability rather than discarded, since the code itself is
+# correct and tested. Per product-owner amendment, this provides the same trust level as the
+# GitHub adapter above -- a trusted API attestation read from GitLab's own approval state, not
+# independent non-repudiation/signing. Per the data-minimization amendment, only the approver's
+# pseudonymous username is ever persisted (never name/email/avatar).
+GITLAB_MR_URI = re.compile(
+    r"^gitlab-mr:(?P<project_path>[A-Za-z0-9_./-]+):merge_requests/(?P<iid>\d+):"
+    r"approval/(?P<approval_id>[^:]+):approver/(?P<username>[A-Za-z0-9_.-]+)$"
 )
 
 
@@ -236,8 +250,8 @@ def approval_source_policy(project: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("project approval_sources must be a JSON object")
     source = policy.get("human_gate_default", "manual")
     allow_manual_fallback = policy.get("allow_manual_fallback", True)
-    if source not in {"manual", "github-review"}:
-        raise ValueError("project approval_sources.human_gate_default must be 'manual' or 'github-review'")
+    if source not in {"manual", "github-review", "gitlab-mr"}:
+        raise ValueError("project approval_sources.human_gate_default must be 'manual', 'github-review', or 'gitlab-mr'")
     if not isinstance(allow_manual_fallback, bool):
         raise ValueError("project approval_sources.allow_manual_fallback must be a boolean")
     return {
@@ -324,6 +338,119 @@ def select_github_review(
     latest = matching[-1]
     if latest.get("state") != "APPROVED" or latest.get("dismissed_state") in {"DISMISSED", "dismissed"}:
         raise ValueError(f"latest GitHub review for reviewer {reviewer_login} is not an effective approval")
+    return latest
+
+
+def gitlab_username_from_identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if value.startswith("gitlab.com/"):
+        username = value.removeprefix("gitlab.com/").strip("/")
+        return username or None
+    return None
+
+
+def authority_gitlab_username(authority: dict[str, Any]) -> str | None:
+    explicit = authority.get("gitlab_username")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    return gitlab_username_from_identity(authority.get("assignee"))
+
+
+def parse_gitlab_mr_uri(value: str) -> dict[str, str] | None:
+    match = GITLAB_MR_URI.fullmatch(value)
+    if not match:
+        return None
+    return match.groupdict()
+
+
+def gitlab_approval_records_from_api_response(raw: Any) -> list[dict[str, Any]]:
+    """Normalize GitLab's single merge-request approvals-state object into a
+    per-approver record list, mirroring the GitHub per-review shape. Only the
+    fields required for evidence (username, approval identifier, decision
+    state, decision time, reviewed commit) are extracted; GitLab API fields
+    such as name/email/avatar_url are intentionally never read here (data
+    minimization amendment)."""
+    if not isinstance(raw, dict):
+        raise ValueError("GitLab approvals API response must be a JSON object")
+    approved_by = raw.get("approved_by", [])
+    commit_sha = raw.get("sha")
+    records: list[dict[str, Any]] = []
+    if isinstance(approved_by, list):
+        for entry in approved_by:
+            user = entry.get("user") if isinstance(entry, dict) else None
+            username = user.get("username") if isinstance(user, dict) else None
+            if not isinstance(username, str) or not username:
+                continue
+            user_id = user.get("id") if isinstance(user, dict) else None
+            # Presence in `approved_by` is GitLab's per-user approval signal
+            # and is independent of the MR-level `approved` flag (which only
+            # reflects whether the overall approval-rule threshold has been
+            # met). Do not conflate the two: a user who has approved but is
+            # still waiting on other approvers must still show "approved"
+            # here; gate/threshold sufficiency is decided elsewhere.
+            records.append({
+                "approval_id": str(user_id) if user_id is not None else username,
+                "username": username,
+                "state": "approved",
+                "decided_at": raw.get("updated_at"),
+                "commit_sha": commit_sha,
+            })
+    return records
+
+
+def fetch_gitlab_mr_approvals(project_path: str, mr_iid: int) -> list[dict[str, Any]]:
+    mock_path = os.environ.get("AGENTIC_SDLC_TEST_GITLAB_APPROVALS_FILE")
+    if mock_path:
+        raw_response = json.loads(Path(mock_path).read_text(encoding="utf-8"))
+    else:
+        encoded_project = quote(project_path, safe="")
+        result = subprocess.run(
+            ["glab", "api", f"projects/{encoded_project}/merge_requests/{mr_iid}/approvals"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown glab api failure"
+            raise ValueError(f"unable to fetch GitLab MR approvals for {project_path} MR {mr_iid}: {detail}")
+        raw_response = json.loads(result.stdout)
+    # Both the mocked and real branches feed the raw `glab api` response
+    # shape through the same normalizer call, so tests exercising the mock
+    # path also exercise the data-minimization wiring (Amendment B).
+    payload = gitlab_approval_records_from_api_response(raw_response)
+    if not isinstance(payload, list):
+        raise ValueError("GitLab approvals response must be a JSON array")
+    approvals = [item for item in payload if isinstance(item, dict)]
+    if len(approvals) != len(payload):
+        raise ValueError("GitLab approvals response contains non-object entries")
+    return approvals
+
+
+def select_gitlab_approval(
+    approvals: list[dict[str, Any]], approver_username: str, commit_sha: str | None = None
+) -> dict[str, Any]:
+    normalized_username = approver_username.lower()
+    normalized_commit = normalize_commit_sha(commit_sha)
+    matching: list[dict[str, Any]] = []
+    for approval in approvals:
+        username = approval.get("username")
+        decided_at = approval.get("decided_at")
+        approval_commit = normalize_commit_sha(approval.get("commit_sha"))
+        if not isinstance(username, str) or username.lower() != normalized_username:
+            continue
+        if not is_valid_datetime(decided_at):
+            continue
+        if normalized_commit and approval_commit != normalized_commit:
+            continue
+        matching.append(approval)
+    if not matching:
+        commit_text = f" at commit {commit_sha}" if commit_sha else ""
+        raise ValueError(f"no GitLab approval found for approver {approver_username}{commit_text}")
+    matching.sort(key=lambda approval: str(approval.get("decided_at")))
+    latest = matching[-1]
+    if str(latest.get("state")).lower() not in {"approved", "active"}:
+        raise ValueError(f"latest GitLab approval for approver {approver_username} is not an effective approval")
     return latest
 
 
@@ -471,6 +598,109 @@ def record_github_approval(
         "gate_id": gate_id,
         "authority_id": authority_role,
         "review_uri": review_uri,
+        "gate_status": gate.get("status"),
+        "current_phase": derive_current_phase(record),
+    }
+
+
+def record_gitlab_approval(
+    root: Path,
+    task_id: str,
+    gate_id: str,
+    authority_role: str,
+    project_path: str,
+    mr_iid: int,
+    approval_id: str,
+    approver_username: str,
+    commit_sha: str,
+    decided_at: str | None,
+) -> dict[str, Any]:
+    """Record GitLab MR approval evidence. This is a trusted-API-attestation
+    adapter with the same trust level as record_github_approval: it treats
+    GitLab's own approval state as authoritative and does not attempt
+    independent signing or non-repudiation beyond that. Per the data
+    minimization amendment, only the pseudonymous approver username is ever
+    persisted in the evidence record or URI -- never name, email, or
+    avatar_url."""
+    _, project, authorities, _, _ = load_overlay(root)
+    path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
+    record = load_json(path)
+    approval_source_policy(project)
+    gate = next((item for item in record.get("lifecycle_gates", []) if item.get("gate_id") == gate_id), None)
+    if gate is None:
+        raise ValueError(f"unknown gate in run record: {gate_id}")
+    authority = authorities.get(authority_role)
+    if not isinstance(authority, dict):
+        raise ValueError(f"unknown authority role: {authority_role}")
+    requirement = human_requirement_for_gate(gate, authority_role)
+    if requirement is None:
+        raise ValueError(f"{gate_id} does not require authority role {authority_role}")
+    if requirement.get("applicability") != "applicable":
+        raise ValueError(f"{gate_id} authority role {authority_role} is not applicable")
+    expected_assignee = authority.get("assignee")
+    if authority.get("status") != "assigned" or not expected_assignee:
+        raise ValueError(f"authority {authority_role} is not assigned")
+    expected_username = authority_gitlab_username(authority)
+    normalized_approver_username = approver_username.lower()
+    normalized_expected_username = expected_username.lower() if isinstance(expected_username, str) else None
+    if normalized_expected_username and normalized_approver_username != normalized_expected_username:
+        raise ValueError(
+            f"GitLab approver {approver_username} does not match assigned authority username {expected_username}"
+        )
+    approval_uri = f"gitlab-mr:{project_path}:merge_requests/{mr_iid}:approval/{approval_id}:approver/{normalized_approver_username}"
+    if parse_gitlab_mr_uri(approval_uri) is None:
+        raise ValueError(f"invalid GitLab MR approval URI components for {approval_uri}")
+    chosen_time = decided_at or now()
+    if not is_valid_datetime(chosen_time):
+        raise ValueError("--decided-at must be a valid RFC 3339 date-time")
+    role_label = requirement.get("role")
+    evidence_payload = {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "project_path": project_path,
+        "merge_request_iid": mr_iid,
+        "approval_id": approval_id,
+        "approver_username": normalized_approver_username,
+        "decided_at": chosen_time,
+        "commit_sha": commit_sha,
+    }
+    approval = {
+        "status": "approved",
+        "approver": {"id": expected_assignee, "role": role_label, "kind": "human"},
+        "decided_at": chosen_time,
+        "evidence_refs": [{
+            "evidence_id": f"{gate_id.lower()}-{authority_role}-gitlab-mr-{approval_id}",
+            "uri": approval_uri,
+            "hash_algorithm": "sha256",
+            "hash": fingerprint(evidence_payload).removeprefix("sha256:"),
+            "classification": record.get("classification", project.get("classification", "internal")),
+        }],
+    }
+    remaining = [
+        item
+        for item in gate.get("human_approvals", [])
+        if not (
+            item.get("status") == "approved"
+            and isinstance(item.get("approver"), dict)
+            and item["approver"].get("id") == expected_assignee
+            and item["approver"].get("role") == role_label
+        )
+    ]
+    remaining.append(approval)
+    gate["human_approvals"] = remaining
+    if can_mark_gate_approved(record, gate, authorities):
+        gate["status"] = "approved"
+        gate["decided_at"] = max(
+            [approval_item.get("decided_at") for approval_item in approved_human_approvals(gate) if approval_item.get("decided_at")] or [chosen_time]
+        )
+        record["current_lifecycle_phase"] = derive_current_phase(record)
+    write_json(path, record)
+    return {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "approval_uri": approval_uri,
         "gate_status": gate.get("status"),
         "current_phase": derive_current_phase(record),
     }
@@ -713,16 +943,21 @@ def agent_wrapper_body(agent_id: str, reviewer: bool, metadata: dict[str, Any], 
     return agent_wrapper_instructions(agent_id, reviewer)
 
 
-def write_codex_agent_wrappers(root: Path, profile: dict[str, Any], catalog: dict[str, Any]) -> list[str]:
+def write_codex_agent_wrappers(
+    root: Path, profile: dict[str, Any], catalog: dict[str, Any], dry_run: bool = False
+) -> tuple[list[str], list[str]]:
     created: list[str] = []
+    existing: list[str] = []
     wrapper_dir = confined_path(root, ".codex", "agents")
-    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
     for agent_id in profile.get("agents", []):
         metadata = catalog.get(agent_id)
         if not metadata:
             continue
         target = wrapper_dir / f"{agent_id}.toml"
         if target.exists():
+            existing.append(str(target.relative_to(root)))
             continue
         reviewer = metadata["kind"] == "reviewer"
         content = "\n".join([
@@ -732,21 +967,27 @@ def write_codex_agent_wrappers(root: Path, profile: dict[str, Any], catalog: dic
             f"developer_instructions = {toml_string(agent_wrapper_body(agent_id, reviewer, metadata, profile))}",
             "",
         ])
-        target.write_text(content, encoding="utf-8")
+        if not dry_run:
+            target.write_text(content, encoding="utf-8")
         created.append(str(target.relative_to(root)))
-    return created
+    return created, existing
 
 
-def write_claude_agent_wrappers(root: Path, profile: dict[str, Any], catalog: dict[str, Any]) -> list[str]:
+def write_claude_agent_wrappers(
+    root: Path, profile: dict[str, Any], catalog: dict[str, Any], dry_run: bool = False
+) -> tuple[list[str], list[str]]:
     created: list[str] = []
+    existing: list[str] = []
     wrapper_dir = confined_path(root, ".claude", "agents")
-    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
     for agent_id in profile.get("agents", []):
         metadata = catalog.get(agent_id)
         if not metadata:
             continue
         target = wrapper_dir / f"{agent_id}.md"
         if target.exists():
+            existing.append(str(target.relative_to(root)))
             continue
         reviewer = metadata["kind"] == "reviewer"
         description = "Portable Agentic SDLC " + metadata.get("kind", "specialist") + " for " + metadata.get("phase", "lifecycle")
@@ -758,19 +999,27 @@ def write_claude_agent_wrappers(root: Path, profile: dict[str, Any], catalog: di
             "---",
             "",
         ])
-        target.write_text(frontmatter + agent_wrapper_body(agent_id, reviewer, metadata, profile) + "\n", encoding="utf-8")
+        if not dry_run:
+            target.write_text(frontmatter + agent_wrapper_body(agent_id, reviewer, metadata, profile) + "\n", encoding="utf-8")
         created.append(str(target.relative_to(root)))
-    return created
+    return created, existing
 
 
-def write_agent_wrappers(root: Path, profile: dict[str, Any], runner: str = "both") -> list[str]:
+def write_agent_wrappers(
+    root: Path, profile: dict[str, Any], runner: str = "both", dry_run: bool = False
+) -> tuple[list[str], list[str]]:
     catalog = load_agent_catalog()
     created: list[str] = []
+    existing: list[str] = []
     if runner in ("codex", "both"):
-        created.extend(write_codex_agent_wrappers(root, profile, catalog))
+        wrapper_created, wrapper_existing = write_codex_agent_wrappers(root, profile, catalog, dry_run)
+        created.extend(wrapper_created)
+        existing.extend(wrapper_existing)
     if runner in ("claude", "both"):
-        created.extend(write_claude_agent_wrappers(root, profile, catalog))
-    return created
+        wrapper_created, wrapper_existing = write_claude_agent_wrappers(root, profile, catalog, dry_run)
+        created.extend(wrapper_created)
+        existing.extend(wrapper_existing)
+    return created, existing
 
 
 def impact_item(item_id: str, extension: str) -> dict[str, Any]:
@@ -787,7 +1036,9 @@ def impact_item(item_id: str, extension: str) -> dict[str, Any]:
 
 def initialize(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not dry_run:
+        root.mkdir(parents=True, exist_ok=True)
     detected = detect_repository(root)
     profile_id = None if args.profile in {None, "kernel-only"} else (detected["proposed_profile"] if args.profile == "auto" else args.profile)
     profile = merge_profile(profile_id) if profile_id else {"id": "kernel-only", "routing": [], "ignored_gates": [], "gate_bindings": [], "impact_categories": []}
@@ -807,8 +1058,9 @@ def initialize(args: argparse.Namespace) -> int:
         impact.extend(impact_item(item_id, extension_id) for item_id in extension.get("impact_categories", []))
         specialized_boms.extend(impact_item(bom, extension_id) for bom in extension.get("specialized_boms", []))
     overlay = confined_path(root, OVERLAY)
-    overlay.mkdir(parents=True, exist_ok=True)
-    (overlay / "runs").mkdir(exist_ok=True)
+    if not dry_run:
+        overlay.mkdir(parents=True, exist_ok=True)
+        (overlay / "runs").mkdir(exist_ok=True)
     project = {
         "schema_version": 1,
         "project_id": args.project_id or root.name,
@@ -845,13 +1097,42 @@ def initialize(args: argparse.Namespace) -> int:
         "gate_bindings": profile.get("gate_bindings", {}),
     }
     commands = {"version": 1, "commands": detected["command_candidates"], "confirmed": False}
+    overlay_files = [
+        ("project.json", project),
+        ("authorities.json", authorities),
+        ("impact-profile.json", impact_profile),
+        ("routing.json", routing),
+        ("commands.json", commands),
+    ]
+    lock_path = overlay / "version.lock"
+    if dry_run:
+        would_create: list[str] = []
+        existing_unchanged: list[str] = []
+        for name, _value in overlay_files:
+            target = overlay / name
+            (would_create if not target.exists() else existing_unchanged).append(f"{OVERLAY}/{name}")
+        (would_create if not lock_path.exists() else existing_unchanged).append(f"{OVERLAY}/version.lock")
+        wrappers_would_create, wrappers_existing = (
+            write_agent_wrappers(root, profile, args.runner, dry_run=True) if profile_id else ([], [])
+        )
+        print(json.dumps({
+            "status": "dry-run",
+            "mutation": False,
+            "root": str(root),
+            "profile": profile_id,
+            "would_create": would_create,
+            "existing_unchanged": existing_unchanged,
+            "agent_wrappers_would_create": wrappers_would_create,
+            "agent_wrappers_existing": wrappers_existing,
+            "detected": detected,
+        }, indent=2))
+        return 0
     created = []
-    for name, value in [("project.json", project), ("authorities.json", authorities), ("impact-profile.json", impact_profile), ("routing.json", routing), ("commands.json", commands)]:
+    for name, value in overlay_files:
         if write_json(overlay / name, value, overwrite=False):
             created.append(f"{OVERLAY}/{name}")
-    lock = overlay / "version.lock"
-    if not lock.exists():
-        lock.write_text(
+    if not lock_path.exists():
+        lock_path.write_text(
             json.dumps(
                 {
                     "plugin_version": VERSION,
@@ -870,7 +1151,7 @@ def initialize(args: argparse.Namespace) -> int:
         )
         created.append(f"{OVERLAY}/version.lock")
     update_agents_md(root)
-    wrappers = write_agent_wrappers(root, profile, args.runner) if profile_id else []
+    wrappers, _wrappers_existing = write_agent_wrappers(root, profile, args.runner) if profile_id else ([], [])
     print(json.dumps({"status": "initialized", "root": str(root), "profile": profile_id, "created": created, "agent_wrappers_created": wrappers, "ready": False, "blockers": ["Human authorities and impact applicability require explicit decisions."]}, indent=2))
     return 0
 
@@ -1242,6 +1523,14 @@ def validate_repository(args: argparse.Namespace) -> int:
             and not approval_policy["allow_manual_fallback"]
         ):
             blockers.append(f"authority {role} is missing a GitHub login binding required for GitHub review approvals")
+        if (
+            value.get("status") == "assigned"
+            and value.get("applicability", "applicable") == "applicable"
+            and approval_policy["human_gate_default"] == "gitlab-mr"
+            and not authority_gitlab_username(value)
+            and not approval_policy["allow_manual_fallback"]
+        ):
+            blockers.append(f"authority {role} is missing a GitLab username binding required for GitLab MR approvals")
     unknown_impact = [item.get("id", "unnamed") for item in impact.get("impact_categories", []) + impact.get("specialized_boms", []) if item.get("applicability") == "unknown"]
     blockers.extend(f"impact applicability is unknown: {item}" for item in unknown_impact)
     blockers.extend(f"impact profile blocker: {item}" for item in impact.get("blocking_unknowns", []))
@@ -1446,6 +1735,7 @@ def validate_repository(args: argparse.Namespace) -> int:
                     ):
                         errors.append(f"{record_path}: {gate_id} approval lacks decision time or approval evidence")
                     github_review_refs = []
+                    gitlab_mr_refs = []
                     for evidence in approval.get("evidence_refs", []):
                         if not isinstance(evidence, dict):
                             errors.append(f"{record_path}: {gate_id} approval evidence_refs contains a non-object entry")
@@ -1457,6 +1747,12 @@ def validate_repository(args: argparse.Namespace) -> int:
                                 errors.append(f"{record_path}: {gate_id} approval has an invalid GitHub review URI")
                             else:
                                 github_review_refs.append(parsed_review)
+                        elif isinstance(uri, str) and uri.startswith("gitlab-mr:"):
+                            parsed_approval = parse_gitlab_mr_uri(uri)
+                            if parsed_approval is None:
+                                errors.append(f"{record_path}: {gate_id} approval has an invalid GitLab MR approval URI")
+                            else:
+                                gitlab_mr_refs.append(parsed_approval)
                     if approval.get("status") == "approved":
                         if (
                             approval_policy["human_gate_default"] == "github-review"
@@ -1469,6 +1765,17 @@ def validate_repository(args: argparse.Namespace) -> int:
                             for parsed_review in github_review_refs:
                                 if approver_login and approver_login != parsed_review["login"]:
                                     errors.append(f"{record_path}: {gate_id} GitHub review login does not match approver identity")
+                        if (
+                            approval_policy["human_gate_default"] == "gitlab-mr"
+                            and not approval_policy["allow_manual_fallback"]
+                            and not gitlab_mr_refs
+                        ):
+                            errors.append(f"{record_path}: {gate_id} approval must be backed by a GitLab MR approval")
+                        if gitlab_mr_refs and isinstance(approver, dict):
+                            approver_username = gitlab_username_from_identity(approver.get("id"))
+                            for parsed_approval in gitlab_mr_refs:
+                                if approver_username and approver_username != parsed_approval["username"]:
+                                    errors.append(f"{record_path}: {gate_id} GitLab MR approver does not match approver identity")
                 for requirement in requirements:
                     if requirement.get("authority_type") != "human-approver" or requirement.get("applicability") != "applicable":
                         continue
@@ -1496,6 +1803,20 @@ def validate_repository(args: argparse.Namespace) -> int:
                                 for parsed_review in github_review_refs
                             ):
                                 errors.append(f"{record_path}: {gate_id} approval GitHub reviewer does not match assigned authority {authority_id}")
+                    expected_gitlab_username = authority_gitlab_username(authorities.get(authority_id, {}))
+                    if expected_gitlab_username:
+                        for approval in matching:
+                            gitlab_mr_refs = [
+                                parsed_approval
+                                for evidence in approval.get("evidence_refs", [])
+                                for parsed_approval in [parse_gitlab_mr_uri(evidence.get("uri", ""))]
+                                if parsed_approval is not None
+                            ]
+                            if gitlab_mr_refs and any(
+                                str(parsed_approval["username"]).lower() != str(expected_gitlab_username).lower()
+                                for parsed_approval in gitlab_mr_refs
+                            ):
+                                errors.append(f"{record_path}: {gate_id} approval GitLab approver does not match assigned authority {authority_id}")
                 if not gate.get("decided_at"):
                     errors.append(f"{record_path}: {gate_id} approved without a gate decision timestamp")
                 if any(not binding.get("digest") for binding in gate.get("artifact_bindings", [])):
@@ -1726,6 +2047,64 @@ def approve_from_github_pr(args: argparse.Namespace) -> int:
     return 0
 
 
+def approve_from_gitlab(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    result = record_gitlab_approval(
+        root,
+        task_id,
+        args.gate,
+        args.role,
+        args.project_path,
+        args.mr_iid,
+        args.approval_id,
+        args.approver_username,
+        args.commit_sha,
+        args.decided_at,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def approve_from_gitlab_mr(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    _, _, authorities, _, _ = load_overlay(root)
+    authority = authorities.get(args.role)
+    if not isinstance(authority, dict):
+        raise ValueError(f"unknown authority role: {args.role}")
+    approver_username = args.approver_username or authority_gitlab_username(authority)
+    if not approver_username:
+        raise ValueError(f"authority {args.role} has no GitLab username binding and --approver-username was not supplied")
+    approvals = fetch_gitlab_mr_approvals(args.project_path, args.mr_iid)
+    approval = select_gitlab_approval(approvals, approver_username, args.commit_sha)
+    approval_id = approval.get("approval_id")
+    decided_at = approval.get("decided_at")
+    commit_sha = approval.get("commit_sha")
+    if not approval_id:
+        raise ValueError("selected GitLab approval is missing an approval id")
+    if not is_valid_datetime(decided_at):
+        raise ValueError("selected GitLab approval is missing a valid decided_at timestamp")
+    if not isinstance(commit_sha, str) or not commit_sha:
+        raise ValueError("selected GitLab approval is missing a commit sha")
+    result = record_gitlab_approval(
+        root,
+        task_id,
+        args.gate,
+        args.role,
+        args.project_path,
+        args.mr_iid,
+        str(approval_id),
+        approver_username,
+        commit_sha,
+        decided_at,
+    )
+    result["selected_approval_id"] = approval_id
+    result["selected_commit_sha"] = commit_sha
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def provider_introspection(args: argparse.Namespace) -> int:
     if args.resource_kind == "provider":
         if args.action == "list":
@@ -1763,7 +2142,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--project-id")
     init.add_argument("--classification", default="internal")
     init.add_argument("--runner", choices=["codex", "claude", "both"], default="both", help="Which agent runner(s) to generate subagent wrappers for")
-    init.add_argument("--force", action="store_true", help="Refresh managed overlay files; never overwrites custom agent wrappers")
+    init_mode = init.add_mutually_exclusive_group()
+    init_mode.add_argument("--force", action="store_true", help="Refresh managed overlay files; never overwrites custom agent wrappers")
+    init_mode.add_argument("--dry-run", action="store_true", help="Report what init would create without writing anything to disk")
     init.set_defaults(handler=initialize)
     plan = subparsers.add_parser("plan", help="Create a dispatch plan and pending run record")
     plan.add_argument("--root", default=".")
@@ -1799,6 +2180,28 @@ def build_parser() -> argparse.ArgumentParser:
     approve_auto.add_argument("--reviewer-login", help="GitHub login to match; defaults to the authority GitHub binding")
     approve_auto.add_argument("--commit-sha", help="Optional commit SHA to require when selecting an approved review")
     approve_auto.set_defaults(handler=approve_from_github_pr)
+    approve_gitlab = subparsers.add_parser("approve-from-gitlab", help="Record a human gate approval from a GitLab MR approval")
+    approve_gitlab.add_argument("--root", default=".")
+    approve_gitlab.add_argument("--task-id", required=True)
+    approve_gitlab.add_argument("--gate", choices=GATE_IDS, required=True)
+    approve_gitlab.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True, help="Authority role recording the approval")
+    approve_gitlab.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
+    approve_gitlab.add_argument("--mr-iid", type=int, required=True, help="Merge request internal ID (iid)")
+    approve_gitlab.add_argument("--approval-id", required=True, help="GitLab approval identifier")
+    approve_gitlab.add_argument("--approver-username", required=True, help="GitLab username that authored the approval")
+    approve_gitlab.add_argument("--commit-sha", required=True, help="Commit SHA reviewed by the GitLab approval")
+    approve_gitlab.add_argument("--decided-at", help="Approval time in RFC 3339 format; defaults to now")
+    approve_gitlab.set_defaults(handler=approve_from_gitlab)
+    approve_gitlab_auto = subparsers.add_parser("approve-from-gitlab-mr", help="Fetch an approved GitLab MR approval and record it as human gate approval evidence")
+    approve_gitlab_auto.add_argument("--root", default=".")
+    approve_gitlab_auto.add_argument("--task-id", required=True)
+    approve_gitlab_auto.add_argument("--gate", choices=GATE_IDS, required=True)
+    approve_gitlab_auto.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True, help="Authority role recording the approval")
+    approve_gitlab_auto.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
+    approve_gitlab_auto.add_argument("--mr-iid", type=int, required=True, help="Merge request internal ID (iid)")
+    approve_gitlab_auto.add_argument("--approver-username", help="GitLab username to match; defaults to the authority GitLab binding")
+    approve_gitlab_auto.add_argument("--commit-sha", help="Optional commit SHA to require when selecting an approved approval")
+    approve_gitlab_auto.set_defaults(handler=approve_from_gitlab_mr)
     invalid = subparsers.add_parser("invalidate", help="Invalidate the earliest affected gate and all downstream gates")
     invalid.add_argument("--root", default=".")
     invalid.add_argument("--task-id", required=True)

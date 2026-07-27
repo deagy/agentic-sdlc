@@ -2143,7 +2143,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--classification", default="internal")
     init.add_argument("--runner", choices=["codex", "claude", "both"], default="both", help="Which agent runner(s) to generate subagent wrappers for")
     init_mode = init.add_mutually_exclusive_group()
-    init_mode.add_argument("--force", action="store_true", help="Refresh managed overlay files; never overwrites custom agent wrappers")
+    init_mode.add_argument("--force", action="store_true", help="Reserved for future use; in this release init never overwrites existing wrapper or managed overlay files, with or without --force")
     init_mode.add_argument("--dry-run", action="store_true", help="Report what init would create without writing anything to disk")
     init.set_defaults(handler=initialize)
     plan = subparsers.add_parser("plan", help="Create a dispatch plan and pending run record")

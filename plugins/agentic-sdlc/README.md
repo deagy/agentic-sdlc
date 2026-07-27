@@ -61,7 +61,7 @@ Initialization creates or manages this target-repository structure:
 AGENTS.md                      # Small managed Agentic SDLC instruction block
 ```
 
-`init --runner {codex,claude,both}` (default `both`) controls which wrapper set is generated; both are safe to keep even if only one runner is in active use. Existing custom agent wrapper files are not overwritten. Use `init --force` only after reviewing its help: it refreshes managed overlay files and can replace project decisions stored in those managed files.
+`init --runner {codex,claude,both}` (default `both`) controls which wrapper set is generated; both are safe to keep even if only one runner is in active use. Existing custom agent wrapper files are never overwritten, and existing managed overlay files (`.agentic-sdlc/project.json`, `authorities.json`, `impact-profile.json`, `routing.json`, `commands.json`) are never overwritten either. In the current release, `--force` does not change this: `init`, with or without `--force`, is non-destructive and idempotent with respect to already-written wrapper and overlay files. Do not rely on `--force` to refresh managed files or intentionally replace prior project decisions; always check `init --help` for the installed version's actual behavior before assuming otherwise.
 
 ## Safe defaults
 
@@ -127,6 +127,8 @@ validate    Validate the overlay and lifecycle records.
 status      Report lifecycle and gate state for a task.
 approve-from-github  Record a human lifecycle approval from a GitHub PR review.
 approve-from-github-pr  Fetch an approved GitHub PR review and record it as lifecycle approval evidence.
+approve-from-gitlab  Record a human lifecycle approval from a GitLab MR approval. Speculative: not the approval source this kernel's own default provider uses (see "Current limitations").
+approve-from-gitlab-mr  Fetch an approved GitLab MR approval and record it as lifecycle approval evidence. Speculative: not the approval source this kernel's own default provider uses (see "Current limitations").
 invalidate  Record a material change and invalidate the earliest affected gate and its dependents.
 ```
 
@@ -170,6 +172,8 @@ github-review:<owner>/<repo>:pull/<pr>:review/<review-id>:reviewer/<login>
 Assigned human authorities should also include a GitHub identity binding, either through `github_login` or an assignee in `github.com/<login>` form, so validation can confirm the review author matches the assigned approver.
 
 `approve-from-github-pr` uses the GitHub CLI (`gh api repos/<owner>/<repo>/pulls/<pr>/reviews`) to fetch reviews, select the latest matching `APPROVED` review for the authority login, and record it through the same run-record approval path. Supply `--commit-sha` when you need the review tied to an exact reviewed revision; otherwise the command picks the latest approved review for the matching login. It fails closed if `gh` cannot reach GitHub or if no matching approved review exists.
+
+An analogous GitLab MR approval-evidence adapter is available (`approve-from-gitlab` / `approve-from-gitlab-mr`, opt in via `human_gate_default: "gitlab-mr"`), for projects whose authoritative human-approval source is a GitLab merge request rather than a GitHub PR review. It has the same trust level as the GitHub adapter above — a trusted API attestation read from GitLab's own approval state, not independent non-repudiation or signing — and persists only the approver's pseudonymous GitLab username, never their name, email, or avatar. Only `gitlab.com/<username>` identities are recognized by convention; a self-hosted GitLab instance requires an explicit `gitlab_username` authority field. Because GitLab's approvals API exposes MR-level rather than per-approver timestamps and reviewed-commit values, `decided_at` and `commit_sha` in the resulting evidence are MR-level approximations, not exact per-approver facts, and `--commit-sha` filtering correctness depends on the GitLab project having "reset approvals on push" enabled.
 
 `validate` exits with `0` when valid and ready, `2` when structurally valid but blocked by unresolved decisions, and `1` for errors. Treat both `1` and `2` as non-ready in CI.
 
@@ -215,6 +219,7 @@ Keep lifecycle state in version control according to the project's evidence-clas
 - It cannot identify human authorities, legal obligations, risk acceptance, evidence-retention policy, or production authorization.
 - The portable validator fails closed unless `requirements-validation.txt` is installed. With it, validation enforces lifecycle safety semantics and exhaustive Draft 2020-12 structural and format validation against the bundled schemas; CI enables this mode.
 - The plugin prepares and validates decision records but does not authenticate an approver's real-world identity; projects must reference evidence from their authoritative approval system.
+- The GitLab approval-evidence adapter is speculative: this kernel's own default provider profile uses GitHub PR reviews for approvals (GitLab is only its CI/CD platform). The GitLab adapter is fully wired and callable, but is not currently the approval source any bundled provider or profile actually selects.
 - It does not deploy, apply infrastructure, run persistent migrations, accept risk, merge, or approve gates.
 - Project-specific agent wrappers, knowledge-store integrations, CI wiring, and organization-specific impact extensions may require an overlay customization.
 - Specialized SQS/BOM semantics remain unavailable until an authorized owner supplies definitions and applicability.

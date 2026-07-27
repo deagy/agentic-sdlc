@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,16 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 import agentic_sdlc  # type: ignore
 
 
+def tree_hash(root: Path) -> str:
+    """Deterministic content hash of every file under root, keyed by relative
+    path, so a dry-run invocation can be proven to write zero bytes."""
+    hasher = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        hasher.update(str(path.relative_to(root)).encode("utf-8"))
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
+
+
 class V03MigrationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -21,11 +33,18 @@ class V03MigrationTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def run_cli(self, *arguments, provider=False, expected=0):
+    def run_cli(self, *arguments, provider=False, expected=0, env=None):
         command = [sys.executable, str(CLI)]
         if provider:
             command += ["--provider", str(DEFAULT_PROVIDER)]
-        result = subprocess.run(command + list(arguments) + ["--root", str(self.root)], text=True, capture_output=True, check=False)
+        merged_env = {**os.environ, **env} if env else None
+        result = subprocess.run(
+            command + list(arguments) + ["--root", str(self.root)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=merged_env,
+        )
         self.assertEqual(expected, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout or result.stderr)
 
@@ -121,6 +140,324 @@ class V03MigrationTests(unittest.TestCase):
         ]
         with self.assertRaises(ValueError):
             agentic_sdlc.select_github_review(reviews, "reviewer", "abc")
+
+    # -- RG-4: init --dry-run -------------------------------------------------
+
+    def test_init_dry_run_on_fresh_root_writes_nothing(self):
+        before = tree_hash(self.root)
+        result = self.run_cli("init", "--profile", "generic", "--dry-run", provider=True)
+        self.assertEqual("dry-run", result["status"])
+        self.assertFalse(result["mutation"])
+        self.assertEqual("generic", result["profile"])
+        self.assertIn(".agentic-sdlc/project.json", result["would_create"])
+        self.assertEqual([], result["existing_unchanged"])
+        self.assertTrue(result["agent_wrappers_would_create"])
+        self.assertEqual([], result["agent_wrappers_existing"])
+        self.assertIn("detected", result)
+        self.assertEqual("would_create", result["agents_md"])
+        after = tree_hash(self.root)
+        self.assertEqual(before, after)
+        self.assertFalse((self.root / ".agentic-sdlc").exists())
+        self.assertFalse((self.root / ".codex").exists())
+        self.assertFalse((self.root / ".claude").exists())
+        self.assertFalse((self.root / "AGENTS.md").exists())
+
+    def test_init_dry_run_after_real_init_reports_existing_unchanged_and_writes_nothing(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        before = tree_hash(self.root)
+        result = self.run_cli("init", "--profile", "generic", "--dry-run", provider=True)
+        self.assertEqual("dry-run", result["status"])
+        self.assertEqual([], result["would_create"])
+        self.assertIn(".agentic-sdlc/project.json", result["existing_unchanged"])
+        self.assertIn(".agentic-sdlc/version.lock", result["existing_unchanged"])
+        self.assertEqual([], result["agent_wrappers_would_create"])
+        self.assertTrue(result["agent_wrappers_existing"])
+        # update_agents_md() always rewrites the managed block on a real init,
+        # even when AGENTS.md already exists -- dry-run must not claim it's
+        # unchanged just because the file is present.
+        self.assertEqual("would_update_managed_block", result["agents_md"])
+        after = tree_hash(self.root)
+        self.assertEqual(before, after)
+
+    def test_init_real_run_reports_agents_md_created_then_updated(self):
+        first = self.run_cli("init", "--profile", "generic", provider=True)
+        self.assertEqual("created", first["agents_md"])
+        second = self.run_cli("init", "--profile", "generic", provider=True)
+        self.assertEqual("updated_managed_block", second["agents_md"])
+
+    def test_init_dry_run_rejects_combination_with_force(self):
+        result = subprocess.run(
+            [sys.executable, str(CLI), "init", "--dry-run", "--force", "--root", str(self.root)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("not allowed with argument", result.stderr)
+
+    # -- RG-1: GitLab MR approval-evidence adapter ----------------------------
+
+    def test_gitlab_username_and_authority_helpers(self):
+        self.assertEqual("alice", agentic_sdlc.gitlab_username_from_identity("gitlab.com/alice"))
+        self.assertIsNone(agentic_sdlc.gitlab_username_from_identity("github.com/alice"))
+        self.assertIsNone(agentic_sdlc.gitlab_username_from_identity(None))
+        self.assertEqual(
+            "explicit-alice",
+            agentic_sdlc.authority_gitlab_username({"gitlab_username": "explicit-alice", "assignee": "gitlab.com/alice"}),
+        )
+        self.assertEqual("alice", agentic_sdlc.authority_gitlab_username({"assignee": "gitlab.com/alice"}))
+        self.assertIsNone(agentic_sdlc.authority_gitlab_username({"assignee": "not-an-identity"}))
+
+    def test_parse_gitlab_mr_uri(self):
+        parsed = agentic_sdlc.parse_gitlab_mr_uri(
+            "gitlab-mr:group/project:merge_requests/42:approval/7:approver/alice"
+        )
+        self.assertEqual(
+            {"project_path": "group/project", "iid": "42", "approval_id": "7", "username": "alice"},
+            parsed,
+        )
+        self.assertIsNone(agentic_sdlc.parse_gitlab_mr_uri("gitlab-mr:missing-fields"))
+
+    def test_gitlab_approval_records_from_api_response_drops_name_email_and_avatar(self):
+        raw = {
+            "approved": True,
+            "updated_at": "2030-01-01T00:00:00Z",
+            "sha": "abc123",
+            "approved_by": [
+                {
+                    "user": {
+                        "id": 9,
+                        "username": "alice",
+                        "name": "Alice Example",
+                        "email": "alice@example.com",
+                        "avatar_url": "https://example.com/avatar.png",
+                    }
+                }
+            ],
+        }
+        records = agentic_sdlc.gitlab_approval_records_from_api_response(raw)
+        self.assertEqual(
+            [{
+                "approval_id": "9",
+                "username": "alice",
+                "state": "approved",
+                "decided_at": "2030-01-01T00:00:00Z",
+                "commit_sha": "abc123",
+            }],
+            records,
+        )
+        self.assertNotIn("name", records[0])
+        self.assertNotIn("email", records[0])
+        self.assertNotIn("avatar_url", records[0])
+
+    def test_gitlab_latest_pending_state_invalidates_older_approval(self):
+        approvals = [
+            {"approval_id": "1", "username": "alice", "state": "approved", "decided_at": "2030-01-01T00:00:00Z", "commit_sha": "abc"},
+            {"approval_id": "2", "username": "alice", "state": "pending", "decided_at": "2030-01-02T00:00:00Z", "commit_sha": "abc"},
+        ]
+        with self.assertRaises(ValueError):
+            agentic_sdlc.select_gitlab_approval(approvals, "alice", "abc")
+
+    def test_gitlab_approval_records_from_api_response_uses_approved_by_presence_not_mr_threshold(self):
+        # GitLab's `approved_by` lists users who have individually already
+        # approved, independent of whether the MR-level approval-rule
+        # threshold (`approved`) has been satisfied. A partial-progress
+        # response -- one approver in, threshold not yet met -- must still
+        # surface that approver's own approval as "approved".
+        raw = {
+            "approved": False,
+            "updated_at": "2030-01-01T00:00:00Z",
+            "sha": "abc123",
+            "approved_by": [
+                {
+                    "user": {
+                        "id": 9,
+                        "username": "alice",
+                        "name": "Alice Example",
+                        "email": "alice@example.com",
+                        "avatar_url": "https://example.com/avatar.png",
+                    }
+                }
+            ],
+        }
+        records = agentic_sdlc.gitlab_approval_records_from_api_response(raw)
+        selected = agentic_sdlc.select_gitlab_approval(records, "alice", "abc123")
+        self.assertEqual("approved", selected["state"])
+        self.assertEqual("9", selected["approval_id"])
+
+    def test_approval_source_policy_accepts_gitlab_mr_additively(self):
+        self.assertEqual(
+            {"human_gate_default": "gitlab-mr", "allow_manual_fallback": True},
+            agentic_sdlc.approval_source_policy({"approval_sources": {"human_gate_default": "gitlab-mr"}}),
+        )
+        self.assertEqual(
+            {"human_gate_default": "github-review", "allow_manual_fallback": True},
+            agentic_sdlc.approval_source_policy({"approval_sources": {"human_gate_default": "github-review"}}),
+        )
+        with self.assertRaises(ValueError):
+            agentic_sdlc.approval_source_policy({"approval_sources": {"human_gate_default": "bogus"}})
+
+    def _assign_gitlab_authority(self, role="product_owner", username="alice"):
+        authorities_path = self.root / ".agentic-sdlc" / "authorities.json"
+        authorities = self.load(".agentic-sdlc/authorities.json")
+        authorities[role].update({"status": "assigned", "assignee": f"gitlab.com/{username}", "applicability": "applicable"})
+        authorities_path.write_text(json.dumps(authorities), encoding="utf-8")
+
+    def test_approve_from_gitlab_records_username_only_evidence(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_gitlab_authority()
+        self.run_cli("plan", "--task-id", "GL-1", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "approve-from-gitlab",
+            "--task-id", "GL-1",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--project-path", "group/project",
+            "--mr-iid", "42",
+            "--approval-id", "7",
+            "--approver-username", "alice",
+            "--commit-sha", "DEADBEEF",
+            "--decided-at", "2030-01-01T00:00:00Z",
+        )
+        expected_uri = "gitlab-mr:group/project:merge_requests/42:approval/7:approver/alice"
+        self.assertEqual(expected_uri, result["approval_uri"])
+        record = self.load(".agentic-sdlc/runs/GL-1/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        approval = gate["human_approvals"][0]
+        self.assertEqual("gitlab.com/alice", approval["approver"]["id"])
+        evidence = approval["evidence_refs"][0]
+        self.assertEqual(expected_uri, evidence["uri"])
+        self.assertEqual("sha256", evidence["hash_algorithm"])
+        # Amendment B: only the pseudonymous username is ever persisted -- the
+        # serialized run record must not contain any email/name/avatar text.
+        serialized = json.dumps(record)
+        self.assertNotIn("@", serialized)
+        self.assertNotIn("avatar", serialized.lower())
+
+    def test_approve_from_gitlab_rejects_username_mismatch_with_assigned_authority(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_gitlab_authority(username="alice")
+        self.run_cli("plan", "--task-id", "GL-2", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "approve-from-gitlab",
+            "--task-id", "GL-2",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--project-path", "group/project",
+            "--mr-iid", "42",
+            "--approval-id", "7",
+            "--approver-username", "mallory",
+            "--commit-sha", "DEADBEEF",
+            expected=1,
+        )
+        self.assertIn("does not match assigned authority username", result["error"])
+
+    def test_approve_from_gitlab_rejects_role_not_required_by_gate(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_gitlab_authority(role="engineering_lead", username="alice")
+        self.run_cli("plan", "--task-id", "GL-3", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "approve-from-gitlab",
+            "--task-id", "GL-3",
+            "--gate", "G1",
+            "--role", "engineering_lead",
+            "--project-path", "group/project",
+            "--mr-iid", "42",
+            "--approval-id", "7",
+            "--approver-username", "alice",
+            "--commit-sha", "DEADBEEF",
+            expected=1,
+        )
+        self.assertIn("does not require authority role", result["error"])
+
+    def test_approve_from_gitlab_mr_fetches_and_filters_by_commit(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_gitlab_authority(username="alice")
+        self.run_cli("plan", "--task-id", "GL-4", "--task", "Create the service architecture", provider=True)
+        mock_path = self.root / "gitlab-approvals-mock.json"
+        # This mocks the *raw*, unnormalized `glab api
+        # projects/:id/merge_requests/:iid/approvals` response shape (a
+        # single MR-level object, with `name`/`email`/`avatar_url` on the
+        # `user` objects exactly as GitLab actually returns them) rather
+        # than a pre-normalized record list, so this test exercises the
+        # real `fetch_gitlab_mr_approvals` -> normalizer wiring instead of
+        # bypassing it.
+        mock_path.write_text(json.dumps({
+            "approved": False,
+            "updated_at": "2030-01-02T00:00:00Z",
+            "sha": "def",
+            "approved_by": [
+                {
+                    "user": {
+                        "id": 2,
+                        "username": "alice",
+                        "name": "Alice Example",
+                        "email": "alice@example.com",
+                        "avatar_url": "https://example.com/avatar.png",
+                    }
+                }
+            ],
+        }), encoding="utf-8")
+        result = self.run_cli(
+            "approve-from-gitlab-mr",
+            "--task-id", "GL-4",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--project-path", "group/project",
+            "--mr-iid", "42",
+            "--commit-sha", "def",
+            env={"AGENTIC_SDLC_TEST_GITLAB_APPROVALS_FILE": str(mock_path)},
+        )
+        self.assertEqual("2", result["selected_approval_id"])
+        self.assertEqual("def", result["selected_commit_sha"])
+        # Amendment B: the normalizer must have been exercised for real --
+        # no name/email/avatar text leaks into the CLI result or the
+        # persisted run record.
+        serialized_result = json.dumps(result)
+        self.assertNotIn("@", serialized_result)
+        self.assertNotIn("avatar", serialized_result.lower())
+        record = self.load(".agentic-sdlc/runs/GL-4/run-record.json")
+        serialized_record = json.dumps(record)
+        self.assertNotIn("@", serialized_record)
+        self.assertNotIn("avatar", serialized_record.lower())
+        self.assertEqual(
+            "gitlab-mr:group/project:merge_requests/42:approval/2:approver/alice",
+            result["approval_uri"],
+        )
+
+    def test_validate_flags_malformed_gitlab_mr_uri(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_gitlab_authority(username="alice")
+        self.run_cli("plan", "--task-id", "GL-5", "--task", "Create the service architecture", provider=True)
+        self.run_cli(
+            "approve-from-gitlab",
+            "--task-id", "GL-5",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--project-path", "group/project",
+            "--mr-iid", "42",
+            "--approval-id", "7",
+            "--approver-username", "alice",
+            "--commit-sha", "DEADBEEF",
+            "--decided-at", "2030-01-01T00:00:00Z",
+        )
+        record_relative = ".agentic-sdlc/runs/GL-5/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["human_approvals"][0]["evidence_refs"][0]["uri"] = "gitlab-mr:malformed-uri-missing-fields"
+        # The URI-shape check only runs on an approved gate's evidence; force
+        # gate status here (independent of the other approval-completeness
+        # checks, which are exercised elsewhere) so this test isolates the
+        # specific non-regression fix: a malformed gitlab-mr: URI must not
+        # pass through validation unvalidated, exactly like github-review:.
+        gate["status"] = "approved"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.run_cli("validate", provider=True, expected=1)
+        self.assertTrue(
+            any("invalid GitLab MR approval URI" in error for error in result["errors"]),
+            result["errors"],
+        )
 
 
 class AgentCatalogSchemaTests(unittest.TestCase):

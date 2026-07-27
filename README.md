@@ -7,8 +7,13 @@ It owns the G1-G10 lifecycle contracts, project initializer, deterministic
 planner and validator, and approval evidence adapters. Projects own their
 `.agentic-sdlc/` overlays and records.
 
+Install it as a real executable, or run it straight from a checkout:
+
 ```sh
-./bin/agentic-sdlc --help
+pipx install ./plugins/agentic-sdlc   # puts `agentic-sdlc` on PATH, no checkout needed at runtime
+agentic-sdlc --help
+
+./bin/agentic-sdlc --help              # or, from a checkout without installing anything
 python3 -B -m unittest discover -s plugins/agentic-sdlc/test -p "test_*.py"
 ```
 

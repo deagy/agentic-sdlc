@@ -3,11 +3,20 @@ set -eu
 
 BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+KERNEL_ROOT="$REPO_ROOT/plugins/agentic-sdlc"
 
+# Runs the checked-out kernel package in place (dev/CI use, no install
+# required) via `-m`, not by installing/importing an already-installed
+# `agentic-sdlc` distribution -- prepending KERNEL_ROOT onto PYTHONPATH
+# (rather than `cd`-ing there) keeps the caller's own working directory
+# intact for relative --root arguments. A real pip/pipx install of this
+# package (see plugins/agentic-sdlc/pyproject.toml) instead puts an
+# `agentic-sdlc` executable directly on PATH; this script is only the
+# from-checkout convenience wrapper.
 for candidate in python3 python; do
   command -v "$candidate" >/dev/null 2>&1 || continue
   if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
-    exec "$candidate" "$REPO_ROOT/plugins/agentic-sdlc/scripts/agentic_sdlc.py" "$@"
+    PYTHONPATH="$KERNEL_ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$candidate" -m agentic_sdlc "$@"
   fi
 done
 

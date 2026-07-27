@@ -1,6 +1,15 @@
 # Agentic SDLC plugin
 
-This plugin makes the repository's G1–G10 Agentic SDLC portable. It supplies a versioned lifecycle kernel — the G1–G10 gate contracts, mutation-gate definitions, run-record/agent-catalog/profile/provider JSON Schemas — plus a deterministic CLI (`scripts/agentic_sdlc.py`) for bootstrapping a target project's overlay, planning a task's dispatch, and validating lifecycle state, while leaving project-specific authority and lifecycle state in the target repository.
+This plugin makes the repository's G1–G10 Agentic SDLC portable. It supplies a versioned lifecycle kernel — the G1–G10 gate contracts, mutation-gate definitions, run-record/agent-catalog/profile/provider JSON Schemas — plus a deterministic CLI (`agentic_sdlc/`, the pip/pipx-installable `agentic-sdlc` distribution) for bootstrapping a target project's overlay, planning a task's dispatch, and validating lifecycle state, while leaving project-specific authority and lifecycle state in the target repository.
+
+## Install
+
+```sh
+pipx install ./plugins/agentic-sdlc        # from a checkout
+pipx install git+https://github.com/deagy/agentic-sdlc.git#subdirectory=plugins/agentic-sdlc
+```
+
+Either form puts a real `agentic-sdlc` executable on `PATH`, isolated in its own environment, with no repository checkout required at runtime — `contracts/` is bundled into the installed distribution at build time (see `pyproject.toml`). `pip install` works the same way if you'd rather manage the environment yourself; use `pip install -e ./plugins/agentic-sdlc` for an editable install while developing the kernel itself. Requires Python 3.10+.
 
 Orchestrating actual work against this kernel — dispatching author/reviewer roles, stopping at human/mutation gates, tracking gate state across a task's lifetime — is done by the LangGraph engine in [`../../agentic_sdlc_langgraph/`](../../agentic_sdlc_langgraph), not by this plugin. See that package's README for the `agentic-sdlc-lg` CLI and the standalone service. (An earlier version of this plugin shipped that orchestration as six Claude Code/Codex CLI skills an LLM host had to interpret step by step; those were retired once the LangGraph engine replaced them with real, testable control flow.)
 
@@ -16,8 +25,9 @@ Initialization makes a project immediately usable for planning, artifact prepara
 
 ## Initialize a project
 
-The canonical command is the direct `agentic-sdlc` executable (or
-`plugins/agentic-sdlc/scripts/agentic_sdlc.py` during development):
+The canonical command is the installed `agentic-sdlc` executable (see
+"Install" above), or `./bin/agentic-sdlc` / `python3 -m agentic_sdlc` from a
+checkout during development, without installing anything:
 
 ```sh
 agentic-sdlc init --root /path/to/target
@@ -117,7 +127,7 @@ version, and manifest digest are recorded in the project version lock.
 
 ## Commands
 
-The bundled command entry point is `plugins/agentic-sdlc/scripts/agentic_sdlc.py`:
+The bundled command entry point is `plugins/agentic-sdlc/agentic_sdlc/` (the `agentic-sdlc` distribution's `[project.scripts]` entry point; see "Install" above):
 
 ```text
 init        Create or update a project overlay using safe defaults.

@@ -9,10 +9,21 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PLUGIN_ROOT.parents[1]
-CLI = PLUGIN_ROOT / "scripts" / "agentic_sdlc.py"
 DEFAULT_PROVIDER = REPOSITORY_ROOT / "providers" / "agentic-sdlc-defaults" / "provider.json"
-sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+sys.path.insert(0, str(PLUGIN_ROOT))
 import agentic_sdlc  # type: ignore
+
+# Every subprocess invocation below exercises the checked-out package via
+# `-m` (the same invocation bin/agentic-sdlc uses), not an installed
+# `agentic-sdlc` distribution -- PYTHONPATH must carry PLUGIN_ROOT since a
+# subprocess doesn't inherit this test process's sys.path.insert() above.
+CLI_COMMAND = [sys.executable, "-m", "agentic_sdlc"]
+
+
+def cli_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    merged = {**os.environ, **(overrides or {})}
+    merged["PYTHONPATH"] = os.pathsep.join(filter(None, [str(PLUGIN_ROOT), merged.get("PYTHONPATH")]))
+    return merged
 
 
 def tree_hash(root: Path) -> str:
@@ -34,16 +45,15 @@ class V03MigrationTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def run_cli(self, *arguments, provider=False, expected=0, env=None):
-        command = [sys.executable, str(CLI)]
+        command = list(CLI_COMMAND)
         if provider:
             command += ["--provider", str(DEFAULT_PROVIDER)]
-        merged_env = {**os.environ, **env} if env else None
         result = subprocess.run(
             command + list(arguments) + ["--root", str(self.root)],
             text=True,
             capture_output=True,
             check=False,
-            env=merged_env,
+            env=cli_env(env),
         )
         self.assertEqual(expected, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout or result.stderr)
@@ -101,7 +111,13 @@ class V03MigrationTests(unittest.TestCase):
         provider.update({"id": "bad-provider", "agent_catalog": "catalog.json", "profile_roots": ["profiles"]})
         manifest = root / "provider.json"
         manifest.write_text(json.dumps(provider), encoding="utf-8")
-        result = subprocess.run([sys.executable, str(CLI), "--provider", str(manifest), "provider", "list"], text=True, capture_output=True, check=False)
+        result = subprocess.run(
+            CLI_COMMAND + ["--provider", str(manifest), "provider", "list"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=cli_env(),
+        )
         self.assertEqual(1, result.returncode)
         self.assertIn("reviewer", result.stderr)
 
@@ -187,10 +203,11 @@ class V03MigrationTests(unittest.TestCase):
 
     def test_init_dry_run_rejects_combination_with_force(self):
         result = subprocess.run(
-            [sys.executable, str(CLI), "init", "--dry-run", "--force", "--root", str(self.root)],
+            CLI_COMMAND + ["init", "--dry-run", "--force", "--root", str(self.root)],
             text=True,
             capture_output=True,
             check=False,
+            env=cli_env(),
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("not allowed with argument", result.stderr)

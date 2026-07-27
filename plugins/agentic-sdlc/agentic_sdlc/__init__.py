@@ -18,7 +18,23 @@ from urllib.parse import quote
 
 
 VERSION = "0.3.0"
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
+# Packaged as the `agentic-sdlc` pip/pipx-installable distribution (see
+# plugins/agentic-sdlc/pyproject.toml); contracts/ is bundled as package data
+# by hatchling's force-include at build time, but the checked-out source tree
+# deliberately keeps a single canonical copy at plugins/agentic-sdlc/contracts/
+# (not duplicated under this package directory) since
+# agentic_sdlc_langgraph/agentic_sdlc_langgraph/runtime.py also reads it
+# directly from that fixed repo-relative path. Resolve either location
+# correctly: a bundled copy at agentic_sdlc/contracts/ (installed/built) if
+# present, else the sibling ../contracts/ (running from a checkout, installed
+# editable, or via `python -m agentic_sdlc`/bin/agentic-sdlc).
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_BUNDLED_CONTRACTS = _PACKAGE_DIR / "contracts"
+if _BUNDLED_CONTRACTS.is_dir():
+    PLUGIN_ROOT = _PACKAGE_DIR
+else:
+    PLUGIN_ROOT = _PACKAGE_DIR.parent
 CONTRACTS = PLUGIN_ROOT / "contracts"
 PROFILES = PLUGIN_ROOT / "profiles"
 EXTENSIONS = PLUGIN_ROOT / "extensions"

@@ -139,6 +139,8 @@ approve-from-github  Record a human lifecycle approval from a GitHub PR review.
 approve-from-github-pr  Fetch an approved GitHub PR review and record it as lifecycle approval evidence.
 approve-from-gitlab  Record a human lifecycle approval from a GitLab MR approval. Speculative: not the approval source this kernel's own default provider uses (see "Current limitations").
 approve-from-gitlab-mr  Fetch an approved GitLab MR approval and record it as lifecycle approval evidence. Speculative: not the approval source this kernel's own default provider uses (see "Current limitations").
+link-intent-from-gitlab-issue  Link a GitLab issue as the recorded source for G1 Intent.
+link-requirements-from-gitlab-issue  Link a GitLab issue as the recorded source for G2 Requirements Baseline.
 invalidate  Record a material change and invalidate the earliest affected gate and its dependents.
 ```
 
@@ -184,6 +186,21 @@ Assigned human authorities should also include a GitHub identity binding, either
 `approve-from-github-pr` uses the GitHub CLI (`gh api repos/<owner>/<repo>/pulls/<pr>/reviews`) to fetch reviews, select the latest matching `APPROVED` review for the authority login, and record it through the same run-record approval path. Supply `--commit-sha` when you need the review tied to an exact reviewed revision; otherwise the command picks the latest approved review for the matching login. It fails closed if `gh` cannot reach GitHub or if no matching approved review exists.
 
 An analogous GitLab MR approval-evidence adapter is available (`approve-from-gitlab` / `approve-from-gitlab-mr`, opt in via `human_gate_default: "gitlab-mr"`), for projects whose authoritative human-approval source is a GitLab merge request rather than a GitHub PR review. It has the same trust level as the GitHub adapter above — a trusted API attestation read from GitLab's own approval state, not independent non-repudiation or signing — and persists only the approver's pseudonymous GitLab username, never their name, email, or avatar. Only `gitlab.com/<username>` identities are recognized by convention; a self-hosted GitLab instance requires an explicit `gitlab_username` authority field. Because GitLab's approvals API exposes MR-level rather than per-approver timestamps and reviewed-commit values, `decided_at` and `commit_sha` in the resulting evidence are MR-level approximations, not exact per-approver facts, and `--commit-sha` filtering correctness depends on the GitLab project having "reset approvals on push" enabled.
+
+### Linking a GitLab issue as an intent/requirements source
+
+`link-intent-from-gitlab-issue` and `link-requirements-from-gitlab-issue` record where a task's G1 Intent or G2 Requirements Baseline actually came from, by fetching and validating a real GitLab issue rather than accepting a free-text label. This is a deliberately new capability, not a "speculative" one the way the GitLab MR approval adapter above is — it fills a gap that existed for every task until now: `intent_record_id`/`requirements_baseline_id` are run-record fields that have always existed in the schema but, before this, nothing ever set them.
+
+```sh
+agentic-sdlc link-intent-from-gitlab-issue --root /path/to/target --task-id TEAM-DEMO-001 --role product_owner --project-path group/project --issue-iid 42
+agentic-sdlc link-requirements-from-gitlab-issue --root /path/to/target --task-id TEAM-DEMO-001 --role engineering_lead --project-path group/project --issue-iid 42
+```
+
+Each command fetches the issue via `glab api projects/<project>/issues/<iid>`, records it as gate-level evidence in the form `gitlab-issue:<project-path>:issues/<iid>`, and sets the corresponding run-record field to that URI. Re-linking replaces the gate's prior source-link evidence rather than accumulating it — including when the new link points at a different issue than the one previously linked, so the gate always carries at most one source-link entry, matching `intent_record_id`/`requirements_baseline_id`'s single-URI semantics. `invalidate`/`reenter` on G1/G2 clear the linked source (both the gate evidence and the run-record field) along with the rest of the gate's contribution, since a re-baselined gate no longer has a settled source.
+
+**This is deliberately not approval evidence.** Linking a GitLab issue never marks G1/G2 approved, and gate approval (`approve-from-github`/`approve-from-gitlab*` above, or the LangGraph engine's `human_approval_{gate}` interrupt) is completely unaffected by whether a source is linked — the two are orthogonal by design. Authorization still requires the caller's `--role` to be an assigned, applicable authority for the target gate (the same discipline the approval adapters use), so only accountable humans can attach a source, but attaching one is not itself a sign-off.
+
+Unlike the approval adapters, no per-person identity is ever fetched or persisted here — an issue link has no "approver" concept, so there is nothing to data-minimize away. Only the issue's `iid`, `title`, `state`, and `web_url` are used.
 
 `validate` exits with `0` when valid and ready, `2` when structurally valid but blocked by unresolved decisions, and `1` for errors. Treat both `1` and `2` as non-ready in CI.
 

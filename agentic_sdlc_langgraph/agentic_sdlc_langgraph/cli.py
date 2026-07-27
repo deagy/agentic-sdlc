@@ -33,6 +33,7 @@ from langgraph.types import Command
 from . import runtime
 from .contracts import load_lifecycle_gates
 from .export import export_run_record
+from .gitlab_issue import resolve_issue_reference
 from .reentry import invalidate_gates, reenter_gate
 from .validate import validate_run_record
 
@@ -100,7 +101,21 @@ def cmd_plan(args: argparse.Namespace) -> int:
         )
         return 0
 
-    result = graph.invoke(runtime.initial_state(args.task_id, args.task), config=config)
+    try:
+        intent_record_id = resolve_issue_reference(args.intent_gitlab_issue)
+        requirements_baseline_id = resolve_issue_reference(args.requirements_gitlab_issue)
+    except ValueError as exc:
+        _error(str(exc))
+        return 1
+    result = graph.invoke(
+        runtime.initial_state(
+            args.task_id,
+            args.task,
+            intent_record_id=intent_record_id,
+            requirements_baseline_id=requirements_baseline_id,
+        ),
+        config=config,
+    )
     _print(runtime.invoke_result_payload(result))
     return 0
 
@@ -244,6 +259,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument("--profile", default="generic")
     plan_p.add_argument("--ignored-gates", default="", help="Comma-separated gate ids, e.g. G4,G5")
     plan_p.add_argument("--provider", default=None, help="Path to a provider manifest (provider.json)")
+    plan_p.add_argument(
+        "--intent-gitlab-issue",
+        default=None,
+        help="Link a GitLab issue as G1 Intent's source, in <project-path>#<iid> form (e.g. group/project#42)",
+    )
+    plan_p.add_argument(
+        "--requirements-gitlab-issue",
+        default=None,
+        help="Link a GitLab issue as G2 Requirements Baseline's source, in <project-path>#<iid> form",
+    )
     plan_p.set_defaults(func=cmd_plan)
 
     resume_p = sub.add_parser("resume", help="Resume an interrupted task with a decision.")

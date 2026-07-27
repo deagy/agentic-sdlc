@@ -81,6 +81,50 @@ def test_plan_rejects_conflicting_task_text(tmp_path: Path, capsys):
     assert "different task text" in err
 
 
+def test_plan_links_gitlab_issues_and_export_reflects_them(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch):
+    # fetch_gitlab_issue(project_path, issue_iid) returns {"iid": issue_iid,
+    # ...} using the *requested* iid (parsed from the --*-gitlab-issue
+    # reference string), not whatever "iid" happens to be in the mocked
+    # response body -- exactly matching a real `glab api
+    # projects/:id/issues/:iid` call, where the requested iid and the
+    # response's iid are always the same value anyway. So one shared mock
+    # file is enough to distinguish the two links; only the reference
+    # strings' iid parts (42 vs 43) need to differ.
+    mock_issue = {"iid": 0, "title": "Support SSO login", "state": "opened", "web_url": None, "updated_at": None}
+    mock_file = tmp_path / "issue.json"
+    mock_file.write_text(json.dumps(mock_issue), encoding="utf-8")
+    monkeypatch.setenv("AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE", str(mock_file))
+
+    code, out, _err = _run_cli(
+        [
+            "plan", "--root", str(tmp_path), "--task-id", "t1", "--task", TASK_TEXT,
+            "--intent-gitlab-issue", "group/project#42",
+            "--requirements-gitlab-issue", "group/project#43",
+        ],
+        capsys,
+    )
+    assert code == 0, _err
+    assert json.loads(out)["status"] == "interrupted"
+
+    code, out, _err = _run_cli(["export", "--root", str(tmp_path), "--task-id", "t1"], capsys)
+    assert code == 0
+    record = json.loads(out)
+    assert record["intent_record_id"] == "gitlab-issue:group/project:issues/42"
+    assert record["requirements_baseline_id"] == "gitlab-issue:group/project:issues/43"
+
+
+def test_plan_rejects_malformed_gitlab_issue_reference(tmp_path: Path, capsys):
+    code, _out, err = _run_cli(
+        [
+            "plan", "--root", str(tmp_path), "--task-id", "t1", "--task", TASK_TEXT,
+            "--intent-gitlab-issue", "not-a-valid-reference",
+        ],
+        capsys,
+    )
+    assert code == 1
+    assert "project-path" in err
+
+
 def test_status_on_unknown_task_fails_cleanly(tmp_path: Path, capsys):
     code, _out, err = _run_cli(["status", "--root", str(tmp_path), "--task-id", "nope"], capsys)
     assert code == 1

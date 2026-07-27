@@ -41,6 +41,13 @@ ROOT=/path/to/project
 uv run agentic-sdlc-lg plan --root "$ROOT" --task-id demo-1 \
   --task "Define and review a small internal order-processing API architecture and service"
 
+# Optionally link a GitLab issue as G1 Intent's / G2 Requirements Baseline's
+# recorded source (fetched and validated via `glab api`, not just a
+# free-text label) -- <project-path>#<iid> form. Never approval evidence;
+# gate approval is unaffected either way. See gitlab_issue.py.
+uv run agentic-sdlc-lg plan --root "$ROOT" --task-id demo-2 \
+  --task "..." --intent-gitlab-issue group/project#42 --requirements-gitlab-issue group/project#43
+
 echo '{"status":"approved","approver":{"id":"product_owner","role":"Product Owner","kind":"human"},"evidence_refs":[]}' \
   > /tmp/decision.json
 uv run agentic-sdlc-lg resume --root "$ROOT" --task-id demo-1 --decision /tmp/decision.json

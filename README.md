@@ -1,6 +1,8 @@
 # Agentic SDLC
 
-Governed software-delivery lifecycle tooling, runner-neutral by design.
+Governed software-delivery lifecycle tooling, runner-neutral by design. See
+[docs/usage-overview.md](docs/usage-overview.md) for what the pieces are and
+how they fit together before diving into the commands below.
 
 The portable kernel lives under [`plugins/agentic-sdlc`](plugins/agentic-sdlc).
 It owns the G1-G10 lifecycle contracts, project initializer, deterministic

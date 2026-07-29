@@ -478,6 +478,82 @@ class V03MigrationTests(unittest.TestCase):
             result["errors"],
         )
 
+    def _approved_g1_gate(self, task_id, verifier):
+        # Shared setup for the three regression tests below (issue #9):
+        # a gate that has already cleared every *other* approved-gate
+        # invariant (applicability, artifact binding, evidence, authority
+        # requirements, human approval) so only the independent-verifier
+        # check under test can produce an error. This deliberately mirrors
+        # test_validate_flags_malformed_gitlab_mr_uri's "force gate status"
+        # pattern: hand-editing the persisted run record to isolate one
+        # check, not exercising the full dispatch/execution completeness
+        # path (covered elsewhere), so other, unrelated errors (missing
+        # dispatched-agent/task-completion records, missing decision
+        # timestamp) are expected to remain and are not asserted on here.
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_gitlab_authority(username="alice")
+        self.run_cli("plan", "--task-id", task_id, "--task", "Create the service architecture", provider=True)
+        self.run_cli(
+            "approve-from-gitlab",
+            "--task-id", task_id,
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--project-path", "group/project",
+            "--mr-iid", "42",
+            "--approval-id", "7",
+            "--approver-username", "alice",
+            "--commit-sha", "DEADBEEF",
+            "--decided-at", "2030-01-01T00:00:00Z",
+        )
+        record_relative = f".agentic-sdlc/runs/{task_id}/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["status"] = "approved"
+        gate["artifact_bindings"] = [{"artifact_id": "a", "revision": "1", "digest": "sha256:00"}]
+        gate["evidence_refs"] = [{
+            "evidence_id": "g1-source",
+            "uri": "gitlab-issue:group/project:issues/1",
+            "hash_algorithm": "sha256",
+            "hash": "00",
+            "classification": "internal",
+        }]
+        gate["independent_verifier"] = verifier
+        gate["independence_declaration"] = {
+            "verifier_confirmed_not_preparer": True,
+            "verifier_made_material_correction": False,
+        }
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        return self.run_cli("validate", provider=True, expected=1)
+
+    def test_validate_accepts_agent_verifier_that_is_a_catalog_reviewer(self):
+        # Regression for issue #9: `required_reviewers` used to be a
+        # hardcoded empty set, so `verifier_role not in required_reviewers`
+        # was unconditionally true and every approved gate was rejected with
+        # "lacks required reviewer role []" regardless of who verified it.
+        result = self._approved_g1_gate("REV-1", {"id": "code-reviewer", "role": "code-reviewer", "kind": "agent"})
+        self.assertFalse(any("lacks required reviewer role" in error for error in result["errors"]), result["errors"])
+        self.assertFalse(any("is not a catalog reviewer" in error for error in result["errors"]), result["errors"])
+
+    def test_validate_rejects_agent_verifier_that_is_not_a_catalog_reviewer(self):
+        result = self._approved_g1_gate("REV-2", {"id": "product-intent-agent", "role": "product-intent-agent", "kind": "agent"})
+        self.assertTrue(
+            any("verifier agent is not a catalog reviewer" in error for error in result["errors"]),
+            result["errors"],
+        )
+        # The old, always-firing dead-code message must never come back.
+        self.assertFalse(any("lacks required reviewer role" in error for error in result["errors"]), result["errors"])
+
+    def test_validate_accepts_human_verifier_without_consulting_the_agent_catalog(self):
+        # A human (or service) verifier's `role` is a free-text label, not an
+        # agent-catalog id -- the agent-catalog reviewer check must not be
+        # applied to it (see the identity schema's `kind` enum: human/agent/
+        # service is a different axis than the agent catalog's own
+        # author/reviewer/specialist `kind`).
+        result = self._approved_g1_gate("REV-3", {"id": "reviewer", "role": "Reviewer", "kind": "human"})
+        self.assertFalse(any("lacks required reviewer role" in error for error in result["errors"]), result["errors"])
+        self.assertFalse(any("is not a catalog reviewer" in error for error in result["errors"]), result["errors"])
+
     def test_parse_gitlab_issue_uri(self):
         parsed = agentic_sdlc.parse_gitlab_issue_uri("gitlab-issue:group/project:issues/42")
         self.assertEqual({"project_path": "group/project", "iid": "42"}, parsed)

@@ -15,12 +15,19 @@ path (the real, current behavior of every shipped profile).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from agentic_sdlc_langgraph.agents import ASK_HUMAN_RULE, resolve_role_prompt
+from agentic_sdlc_langgraph.agents import (
+    ASK_HUMAN_RULE,
+    OpenAICompatibleModelClient,
+    SUBMIT_CONTRIBUTION_TOOL_NAME,
+    resolve_role_prompt,
+)
 from agentic_sdlc_langgraph.graph import build_graph
 
 
@@ -214,3 +221,187 @@ def test_build_graph_threads_rich_role_definition_through_to_dispatched_agents(t
     assert "bespoke-intent-agent" in model_client.seen_role_prompts
     assert distinctive_text in model_client.seen_role_prompts["bespoke-intent-agent"]
     assert ASK_HUMAN_RULE in model_client.seen_role_prompts["bespoke-intent-agent"]
+
+
+class _FakeOpenAIClient:
+    """Stands in for `openai.OpenAI`: records the `chat.completions.create`
+    call it received and returns a canned response shaped like the real
+    SDK's (`response.choices[0].message.tool_calls[i].function.{name,arguments}`),
+    without importing `openai` itself."""
+
+    def __init__(
+        self,
+        tool_call_arguments: dict | None,
+        *,
+        tool_call_name: str = SUBMIT_CONTRIBUTION_TOOL_NAME,
+        raw_arguments: str | None = None,
+    ):
+        self.received_kwargs: dict | None = None
+        if raw_arguments is not None:
+            tool_calls = [SimpleNamespace(function=SimpleNamespace(name=tool_call_name, arguments=raw_arguments))]
+        elif tool_call_arguments is None:
+            tool_calls = []
+        else:
+            tool_calls = [
+                SimpleNamespace(
+                    function=SimpleNamespace(name=tool_call_name, arguments=json.dumps(tool_call_arguments))
+                )
+            ]
+        self._response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=tool_calls))]
+        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.received_kwargs = kwargs
+        return self._response
+
+
+def test_openai_compatible_model_client_builds_agent_output_from_tool_call():
+    fake_client = _FakeOpenAIClient(
+        {
+            "artifact_id": "artifact-42",
+            "revision": "rev-7",
+            "summary": "Did the thing.",
+            "blocking_question": None,
+        }
+    )
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini")
+    client._client = lambda: fake_client
+
+    output = client.complete(
+        agent_id="some-agent",
+        kind="author",
+        gate_id="G1",
+        role_prompt="You are some-agent.",
+        task_text="Do the thing.",
+    )
+
+    assert output["agent_id"] == "some-agent"
+    assert output["kind"] == "author"
+    assert output["gate_id"] == "G1"
+    assert output["artifact_binding"]["artifact_id"] == "artifact-42"
+    assert output["artifact_binding"]["revision"] == "rev-7"
+    assert output["evidence_ref"]["uri"] == "openai://response/G1/some-agent"
+    assert output["blocking_question"] is None
+
+    assert fake_client.received_kwargs["model"] == "gpt-4o-mini"
+    assert fake_client.received_kwargs["messages"][0] == {"role": "system", "content": "You are some-agent."}
+    assert fake_client.received_kwargs["messages"][1] == {"role": "user", "content": "Do the thing."}
+    tool = fake_client.received_kwargs["tools"][0]
+    assert tool["type"] == "function"
+    assert tool["function"]["name"] == SUBMIT_CONTRIBUTION_TOOL_NAME
+
+
+def test_openai_compatible_model_client_surfaces_blocking_question():
+    fake_client = _FakeOpenAIClient(
+        {
+            "artifact_id": "artifact-1",
+            "revision": "rev-1",
+            "summary": "Need input.",
+            "blocking_question": "Which auth provider should this use?",
+        }
+    )
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini")
+    client._client = lambda: fake_client
+
+    output = client.complete(
+        agent_id="some-agent",
+        kind="reviewer",
+        gate_id="G3",
+        role_prompt="You are some-agent.",
+        task_text="Review the thing.",
+    )
+
+    assert output["blocking_question"] == "Which auth provider should this use?"
+
+
+def test_openai_compatible_model_client_falls_back_when_tool_not_called():
+    """If the model returns no matching tool call (e.g. an unexpected or
+    empty response), the client still returns a well-formed `AgentOutput`
+    using the same defaults `AnthropicModelClient` falls back to, rather
+    than raising."""
+    fake_client = _FakeOpenAIClient(None)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini")
+    client._client = lambda: fake_client
+
+    output = client.complete(
+        agent_id="some-agent",
+        kind="author",
+        gate_id="G1",
+        role_prompt="You are some-agent.",
+        task_text="Do the thing.",
+    )
+
+    assert output["artifact_binding"]["artifact_id"] == "G1-some-agent-artifact"
+    assert output["artifact_binding"]["revision"] == "rev-1"
+    assert output["blocking_question"] is None
+
+
+def test_openai_compatible_model_client_falls_back_on_malformed_tool_arguments():
+    """A non-conformant OpenAI-compatible server (this client's whole reason
+    for existing -- vLLM/Ollama/LiteLLM proxies, not just api.openai.com)
+    can return a tool call whose `arguments` isn't valid JSON. That must
+    fall back to the same defaults as "no matching tool call", not crash
+    the LangGraph node."""
+    fake_client = _FakeOpenAIClient(None, raw_arguments="{not valid json")
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini")
+    client._client = lambda: fake_client
+
+    output = client.complete(
+        agent_id="some-agent",
+        kind="author",
+        gate_id="G1",
+        role_prompt="You are some-agent.",
+        task_text="Do the thing.",
+    )
+
+    assert output["artifact_binding"]["artifact_id"] == "G1-some-agent-artifact"
+    assert output["artifact_binding"]["revision"] == "rev-1"
+    assert output["blocking_question"] is None
+
+
+def test_openai_compatible_model_client_reads_api_key_and_base_url_from_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.invalid/v1")
+
+    captured = {}
+
+    class _FakeOpenAIModule:
+        @staticmethod
+        def OpenAI(*, api_key, base_url):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            return _FakeOpenAIClient(None)
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", _FakeOpenAIModule())
+
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini")
+    client._client()
+
+    assert captured["api_key"] == "env-key"
+    assert captured["base_url"] == "https://example.invalid/v1"
+
+
+def test_openai_compatible_model_client_explicit_fields_override_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.invalid/v1")
+
+    captured = {}
+
+    class _FakeOpenAIModule:
+        @staticmethod
+        def OpenAI(*, api_key, base_url):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            return _FakeOpenAIClient(None)
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", _FakeOpenAIModule())
+
+    client = OpenAICompatibleModelClient(
+        model="gpt-4o-mini", api_key="explicit-key", base_url="https://self-hosted.invalid/v1"
+    )
+    client._client()
+
+    assert captured["api_key"] == "explicit-key"
+    assert captured["base_url"] == "https://self-hosted.invalid/v1"

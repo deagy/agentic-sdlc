@@ -18,6 +18,7 @@ fallback (see `resolve_role_prompt`'s docstring).
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -216,6 +217,28 @@ class FakeModelClient:
         )
 
 
+SUBMIT_CONTRIBUTION_TOOL_NAME = "submit_contribution"
+SUBMIT_CONTRIBUTION_DESCRIPTION = "Submit this agent's structured contribution for the gate."
+
+SUBMIT_CONTRIBUTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["artifact_id", "revision", "summary"],
+    "properties": {
+        "artifact_id": {"type": "string"},
+        "revision": {"type": "string"},
+        "summary": {"type": "string"},
+        "blocking_question": {"type": ["string", "null"]},
+    },
+}
+"""Shared shape of the structured tool-call payload every real
+`ModelClient` implementation asks its model to return, so
+`AnthropicModelClient` and `OpenAICompatibleModelClient` don't each
+maintain their own copy of the same contract -- each SDK still wraps this
+schema in its own tool-declaration envelope (`input_schema` vs
+`parameters`), since those envelopes aren't otherwise identical."""
+
+
 @dataclass
 class AnthropicModelClient:
     """Real Anthropic-backed implementation. Not exercised in this
@@ -242,19 +265,9 @@ class AnthropicModelClient:
         task_text: str,
     ) -> AgentOutput:
         tool = {
-            "name": "submit_contribution",
-            "description": "Submit this agent's structured contribution for the gate.",
-            "input_schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["artifact_id", "revision", "summary"],
-                "properties": {
-                    "artifact_id": {"type": "string"},
-                    "revision": {"type": "string"},
-                    "summary": {"type": "string"},
-                    "blocking_question": {"type": ["string", "null"]},
-                },
-            },
+            "name": SUBMIT_CONTRIBUTION_TOOL_NAME,
+            "description": SUBMIT_CONTRIBUTION_DESCRIPTION,
+            "input_schema": SUBMIT_CONTRIBUTION_SCHEMA,
         }
         client = self._client()
         response = client.messages.create(
@@ -262,12 +275,12 @@ class AnthropicModelClient:
             max_tokens=1024,
             system=role_prompt,
             tools=[tool],
-            tool_choice={"type": "tool", "name": "submit_contribution"},
+            tool_choice={"type": "tool", "name": SUBMIT_CONTRIBUTION_TOOL_NAME},
             messages=[{"role": "user", "content": task_text}],
         )
         payload: dict[str, Any] = {}
         for block in response.content:
-            if getattr(block, "type", None) == "tool_use" and block.name == "submit_contribution":
+            if getattr(block, "type", None) == "tool_use" and block.name == SUBMIT_CONTRIBUTION_TOOL_NAME:
                 payload = block.input
                 break
         digest_filler = "0" * 64
@@ -284,6 +297,95 @@ class AnthropicModelClient:
             evidence_ref=EvidenceRef(
                 evidence_id=f"{gate_id}-{agent_id}-evidence",
                 uri=f"anthropic://response/{gate_id}/{agent_id}",
+                hash_algorithm="sha256",
+                hash=digest_filler,
+                classification="internal",
+            ),
+            blocking_question=payload.get("blocking_question"),
+        )
+
+
+@dataclass
+class OpenAICompatibleModelClient:
+    """Talks to any OpenAI-compatible chat-completions HTTP API: OpenAI
+    itself, or a self-hosted/third-party server mirroring its
+    `/v1/chat/completions` request/response shape (vLLM, Ollama's
+    OpenAI-compat endpoint, Azure OpenAI, LiteLLM proxies, etc) via
+    `base_url`. Client-side integration only -- nothing in this repo
+    serves an OpenAI-compatible API. Uses tool (function) calling for a
+    structured reply, mirroring `AnthropicModelClient`.
+    """
+
+    model: str
+    api_key: str | None = None
+    base_url: str | None = None
+
+    def _client(self):  # -> openai.OpenAI
+        import openai  # local import: keep this optional dependency lazy
+
+        return openai.OpenAI(
+            api_key=self.api_key or os.environ.get("OPENAI_API_KEY"),
+            base_url=self.base_url or os.environ.get("OPENAI_BASE_URL"),
+        )
+
+    def complete(
+        self,
+        *,
+        agent_id: str,
+        kind: str,
+        gate_id: str,
+        role_prompt: str,
+        task_text: str,
+    ) -> AgentOutput:
+        tool = {
+            "type": "function",
+            "function": {
+                "name": SUBMIT_CONTRIBUTION_TOOL_NAME,
+                "description": SUBMIT_CONTRIBUTION_DESCRIPTION,
+                "parameters": SUBMIT_CONTRIBUTION_SCHEMA,
+            },
+        }
+        client = self._client()
+        response = client.chat.completions.create(
+            model=self.model,
+            tools=[tool],
+            tool_choice={"type": "function", "function": {"name": SUBMIT_CONTRIBUTION_TOOL_NAME}},
+            messages=[
+                {"role": "system", "content": role_prompt},
+                {"role": "user", "content": task_text},
+            ],
+        )
+        payload: dict[str, Any] = {}
+        tool_calls = response.choices[0].message.tool_calls or []
+        for call in tool_calls:
+            if call.function.name == SUBMIT_CONTRIBUTION_TOOL_NAME:
+                try:
+                    parsed = json.loads(call.function.arguments)
+                except json.JSONDecodeError:
+                    # Unlike Anthropic's already-parsed `block.input`, this is a
+                    # JSON string an arbitrary OpenAI-compatible server produced --
+                    # non-conformant servers are exactly what this client exists to
+                    # tolerate, so malformed arguments fall back to the same
+                    # defaults as "no matching tool call" rather than crashing the
+                    # graph node.
+                    break
+                if isinstance(parsed, dict):
+                    payload = parsed
+                break
+        digest_filler = "0" * 64
+        return AgentOutput(
+            agent_id=agent_id,
+            kind=kind,
+            gate_id=gate_id,
+            identity=Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent"),
+            artifact_binding=ArtifactBinding(
+                artifact_id=payload.get("artifact_id", f"{gate_id}-{agent_id}-artifact"),
+                revision=payload.get("revision", "rev-1"),
+                digest=f"sha256:{digest_filler}",
+            ),
+            evidence_ref=EvidenceRef(
+                evidence_id=f"{gate_id}-{agent_id}-evidence",
+                uri=f"openai://response/{gate_id}/{agent_id}",
                 hash_algorithm="sha256",
                 hash=digest_filler,
                 classification="internal",

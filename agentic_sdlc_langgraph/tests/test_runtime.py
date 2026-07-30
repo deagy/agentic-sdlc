@@ -22,7 +22,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from agentic_sdlc_langgraph import runtime
-from agentic_sdlc_langgraph.agents import AnthropicModelClient, FakeModelClient
+from agentic_sdlc_langgraph.agents import AnthropicModelClient, FakeModelClient, OpenAICompatibleModelClient
 
 TASK_TEXT = "Define and review a small internal order-processing API architecture and service"
 
@@ -157,7 +157,44 @@ def test_default_model_client_is_fake_when_env_var_set(monkeypatch: pytest.Monke
 
 def test_default_model_client_is_anthropic_when_env_var_unset(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.delenv(runtime.MODEL_PROVIDER_ENV_VAR, raising=False)
     assert isinstance(runtime.default_model_client(), AnthropicModelClient)
+
+
+def test_default_model_client_is_anthropic_when_provider_explicit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "anthropic")
+    assert isinstance(runtime.default_model_client(), AnthropicModelClient)
+
+
+def test_default_model_client_is_openai_when_provider_set(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
+    monkeypatch.setenv(runtime.OPENAI_MODEL_ENV_VAR, "gpt-4o-mini")
+    client = runtime.default_model_client()
+    assert isinstance(client, OpenAICompatibleModelClient)
+    assert client.model == "gpt-4o-mini"
+
+
+def test_default_model_client_openai_requires_model_env_var(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
+    monkeypatch.delenv(runtime.OPENAI_MODEL_ENV_VAR, raising=False)
+    with pytest.raises(runtime.GraphConfigError):
+        runtime.default_model_client()
+
+
+def test_default_model_client_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "bogus")
+    with pytest.raises(runtime.GraphConfigError):
+        runtime.default_model_client()
+
+
+def test_fake_model_env_var_takes_precedence_over_provider(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(runtime.FAKE_MODEL_ENV_VAR, "1")
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
+    assert isinstance(runtime.default_model_client(), FakeModelClient)
 
 
 def test_ignored_gates_are_recorded_and_excluded(tmp_path: Path):

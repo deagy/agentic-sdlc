@@ -73,11 +73,22 @@ to reconstruct the graph shape, nothing about live gate status.
 - **Model client** (`AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL` environment
   variable): if set to `"1"`, `default_model_client()` returns a
   `FakeModelClient` (deterministic, zero network calls) instead of a real
-  `AnthropicModelClient`. **This is a real behavioral switch, not just a
+  model-backed client. **This is a real behavioral switch, not just a
   test convenience** -- set it in any environment (local dry runs, CI,
-  demos) that doesn't have `ANTHROPIC_API_KEY` configured, or that wants
+  demos) that doesn't have a model API key configured, or that wants
   reproducible agent output. It is unset (or any value other than `"1"`)
-  in a real deployment, where a live Anthropic-backed run is intended.
+  in a real deployment, where a live model-backed run is intended.
+
+- **Model provider** (`AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` environment
+  variable, checked only when the fake-model switch above is not active):
+  `"anthropic"` (the default, preserving prior behavior) selects
+  `AnthropicModelClient`; `"openai"` selects `OpenAICompatibleModelClient`,
+  reading its required `model` from `AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL`
+  (`OpenAICompatibleModelClient` itself reads `OPENAI_API_KEY`/
+  `OPENAI_BASE_URL`, so those aren't duplicated here) -- this is what lets
+  the engine target any OpenAI-compatible chat-completions server (OpenAI
+  itself, or a self-hosted/third-party server mirroring its API shape)
+  instead of Anthropic.
 """
 
 from __future__ import annotations
@@ -93,7 +104,13 @@ from typing import Any
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from .agents import AnthropicModelClient, DispatchingModelClient, FakeModelClient, ModelClient
+from .agents import (
+    AnthropicModelClient,
+    DispatchingModelClient,
+    FakeModelClient,
+    ModelClient,
+    OpenAICompatibleModelClient,
+)
 from .contracts import (
     load_agent_catalog,
     load_lifecycle_gates,
@@ -120,6 +137,12 @@ GRAPH_CONFIG_SCHEMA_VERSION = 1
 # See module docstring: set to "1" to force FakeModelClient everywhere
 # `default_model_client()` is consulted (no network, fully deterministic).
 FAKE_MODEL_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL"
+
+# See module docstring: selects which real model-backed client
+# `default_model_client()` builds when the fake-model switch above isn't
+# active. Defaults to "anthropic" so existing deployments are unaffected.
+MODEL_PROVIDER_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER"
+OPENAI_MODEL_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL"
 
 
 class GraphConfigError(ValueError):
@@ -159,7 +182,9 @@ def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelCl
 
     Returns a `FakeModelClient` (deterministic, no network) when the
     `AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL` environment variable is set to
-    `"1"`; otherwise a real `AnthropicModelClient`. See module docstring.
+    `"1"`; otherwise a real model-backed client chosen by
+    `AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` (`"anthropic"`, the default, or
+    `"openai"`). See module docstring.
 
     If `agent_catalog` has any entry with `transport: "a2a"`, the
     resolved client is wrapped in a `DispatchingModelClient` so those
@@ -170,7 +195,20 @@ def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelCl
     if os.environ.get(FAKE_MODEL_ENV_VAR) == "1":
         base: ModelClient = FakeModelClient()
     else:
-        base = AnthropicModelClient()
+        provider = os.environ.get(MODEL_PROVIDER_ENV_VAR, "anthropic")
+        if provider == "openai":
+            openai_model = os.environ.get(OPENAI_MODEL_ENV_VAR)
+            if not openai_model:
+                raise GraphConfigError(
+                    f"{OPENAI_MODEL_ENV_VAR} must be set when {MODEL_PROVIDER_ENV_VAR}=openai"
+                )
+            base = OpenAICompatibleModelClient(model=openai_model)
+        elif provider == "anthropic":
+            base = AnthropicModelClient()
+        else:
+            raise GraphConfigError(
+                f"unknown {MODEL_PROVIDER_ENV_VAR}: {provider!r} (expected 'anthropic' or 'openai')"
+            )
     if agent_catalog and any(entry.get("transport") == "a2a" for entry in agent_catalog.values()):
         return DispatchingModelClient(default=base, agent_catalog=agent_catalog)
     return base

@@ -123,7 +123,20 @@ def _status_from_invoke_result(result: dict[str, Any]) -> TaskStatus:
 
 def _status_from_summary(summary: dict[str, Any]) -> TaskStatus:
     if summary["interrupted"]:
-        return TaskStatus(state=TaskState.INPUT_REQUIRED, message=summary["interrupt"])
+        # `interrupt` can legitimately be `None` here (see runtime.py's
+        # `status_summary`): an `update_state` call (invalidate/reenter)
+        # empties `snapshot.interrupts` while the graph stays genuinely
+        # suspended. Never fabricate a payload we don't have -- surface
+        # the fallback fields instead of silently dropping to `None`.
+        message = (
+            summary["interrupt"]
+            if summary["interrupt"] is not None
+            else {
+                "interrupt_payload_unavailable": summary.get("interrupt_payload_unavailable", False),
+                "pending_interrupt_node": summary.get("pending_interrupt_node"),
+            }
+        )
+        return TaskStatus(state=TaskState.INPUT_REQUIRED, message=message)
     applicable = [g for g in summary["gates"] if g["applicability"] != "not-applicable"]
     # Vacuously true for an empty `applicable` list -- a zero-gate task
     # (e.g. "needs-triage": no route phrase matched, so
@@ -244,12 +257,24 @@ def _make_stream_source(params: dict[str, Any]) -> Callable[[], Iterator[str]]:
                 )
             )
         snapshot = graph.get_state(config)
-        interrupted = bool(snapshot.interrupts)
-        final_status = (
-            TaskStatus(state=TaskState.INPUT_REQUIRED, message=snapshot.interrupts[0].value)
-            if interrupted
-            else TaskStatus(state=TaskState.COMPLETED, message=None)
-        )
+        status = runtime.interrupt_status(snapshot)
+        if status.interrupted:
+            # Same fallback as `status_summary`/`_status_from_summary`
+            # (see `runtime.interrupt_status`): a genuinely pending
+            # interrupt whose payload was cleared by an `update_state`
+            # call (invalidate/reenter) must never be reported as
+            # "completed", even though no real payload is available.
+            message = (
+                status.interrupt_value
+                if status.interrupt_value is not None
+                else {
+                    "interrupt_payload_unavailable": status.interrupt_payload_unavailable,
+                    "pending_interrupt_node": status.pending_interrupt_node,
+                }
+            )
+            final_status = TaskStatus(state=TaskState.INPUT_REQUIRED, message=message)
+        else:
+            final_status = TaskStatus(state=TaskState.COMPLETED, message=None)
         yield _sse_event(
             TaskStatusUpdateEvent(taskId=task_id, contextId=task_id, status=final_status, final=True)
         )

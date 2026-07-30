@@ -171,6 +171,19 @@ def _graph_config_path(root: Path, task_id: str) -> Path:
     return _runs_dir(root) / task_id / "graph-config.json"
 
 
+def _requirement_ledger_path(root: Path, task_id: str) -> Path:
+    """`requirement_issues.py`'s sidecar ledger path -- engine-local state
+    analogous to `_graph_config_path` above, never wired into graph
+    dispatch (see `requirement_issues.py`'s module docstring)."""
+    return _runs_dir(root) / task_id / "requirement-issues.json"
+
+
+def _requirement_lock_path(root: Path, task_id: str) -> Path:
+    """Whole-run lock file for `create-requirement-issues`, alongside its
+    ledger (see `_requirement_ledger_path`)."""
+    return _runs_dir(root) / task_id / "requirement-issues.lock"
+
+
 def task_exists(root: str | Path, task_id: str) -> bool:
     """True iff `task_id` already has a `graph-config.json` under `root`
     (i.e. `plan` has already run for it at least once)."""
@@ -565,6 +578,60 @@ def task_status_at(task_id: str, root: Path) -> dict[str, Any]:
     return status_summary(graph, config, metadata)
 
 
+@dataclass(frozen=True)
+class InterruptStatus:
+    """Whether a checkpointed graph snapshot is genuinely suspended at an
+    interrupt, and (if so) whatever payload is actually available for it.
+    See `interrupt_status`'s docstring for the fallback this exists to
+    carry -- shared by `status_summary` (CLI `status` / REST
+    `GET /tasks/{task_id}` / A2A `tasks/get`) and `a2a/server.py`'s
+    `message/stream` SSE terminal event, so no caller re-derives (or
+    forgets to re-derive) the same `snapshot.next` fallback independently.
+    """
+
+    interrupted: bool
+    interrupt_value: Any | None
+    interrupt_payload_unavailable: bool
+    pending_interrupt_node: str | None
+
+
+def interrupt_status(snapshot: Any) -> InterruptStatus:
+    """Derive whether `snapshot` (a `graph.get_state(config)` result) is
+    genuinely suspended at an interrupt.
+
+    `snapshot.interrupts` alone is not reliable: any `update_state` call
+    (`invalidate_gates`/`reenter_gate` in `reentry.py`) empties it while
+    leaving the graph genuinely suspended at the interrupting node
+    (LangGraph re-derives what runs next from `snapshot.next`, not from
+    `snapshot.interrupts`). Without this fallback, a task truly stopped at
+    a human-approval gate reports "not interrupted" -- the single worst
+    thing this tool can misreport. Fail-closed: never under-report a
+    pending human stop, and never fabricate a payload we do not have (see
+    `interrupt_payload_unavailable`/`pending_interrupt_node` above).
+    """
+    interrupted = bool(snapshot.interrupts)
+    interrupt_value = snapshot.interrupts[0].value if interrupted else None
+    interrupt_payload_unavailable = False
+    pending_interrupt_node = None
+
+    if not interrupted:
+        pending = [
+            n for n in (snapshot.next or ())
+            if n.startswith("human_approval_") or n == "mutation_gate_check"
+        ]
+        if pending:
+            interrupted = True
+            interrupt_payload_unavailable = True
+            pending_interrupt_node = pending[0]
+
+    return InterruptStatus(
+        interrupted=interrupted,
+        interrupt_value=interrupt_value,
+        interrupt_payload_unavailable=interrupt_payload_unavailable,
+        pending_interrupt_node=pending_interrupt_node,
+    )
+
+
 def status_summary(graph: Any, config: dict[str, Any], metadata: TaskGraphMetadata) -> dict[str, Any]:
     """Render `graph.get_state(config)` as a small, human/script-readable
     status dict: per-gate status/applicability for every gate in the
@@ -614,13 +681,16 @@ def status_summary(graph: Any, config: dict[str, Any], metadata: TaskGraphMetada
             current_phase = _PHASE_BY_GATE_ID.get(gate["gate_id"], "intent")
             break
 
-    interrupted = bool(snapshot.interrupts)
+    status = interrupt_status(snapshot)
+
     return {
         "task_id": metadata.task_id,
         "current_lifecycle_phase": current_phase,
         "run_halted": values.get("run_halted", False),
-        "interrupted": interrupted,
-        "interrupt": snapshot.interrupts[0].value if interrupted else None,
+        "interrupted": status.interrupted,
+        "interrupt": status.interrupt_value,
+        "interrupt_payload_unavailable": status.interrupt_payload_unavailable,
+        "pending_interrupt_node": status.pending_interrupt_node,
         "gates": gates_summary,
         "re_entry_history_length": len(values.get("re_entry_history", [])),
     }

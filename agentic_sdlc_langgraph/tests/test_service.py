@@ -177,3 +177,29 @@ def test_service_and_cli_share_the_same_on_disk_state(tmp_path):
     status = response.json()
     assert status["gates"][0]["status"] == "approved"  # G1, approved via the CLI
     assert status["interrupt"]["gate_id"] == "G2"  # now suspended at G2, via the service's own view
+
+
+def test_get_task_status_reports_pending_interrupt_after_invalidate(client: TestClient, tmp_path):
+    """K1 fix, exercised through the REST surface: `invalidate` (CLI-only
+    today) calls `graph.update_state(...)`, which empties
+    `snapshot.interrupts` while the graph stays genuinely suspended.
+    `GET /tasks/{task_id}` must still report the pending interrupt."""
+    from agentic_sdlc_langgraph import runtime
+    from agentic_sdlc_langgraph.reentry import invalidate_gates
+
+    root = tmp_path
+    response = client.post("/tasks", json={"task_id": "svc-k1", "task": TASK_TEXT, "root": str(root)})
+    assert response.json()["interrupt"]["gate_id"] == "G1"
+
+    graph, config, metadata = runtime.build_graph_for_task(root, "svc-k1")
+    invalidate_gates(
+        graph, config, earliest_gate_id="G1", reason="test", actor="tester",
+        all_gate_ids=metadata.gate_sequence_ids,
+    )
+
+    response = client.get("/tasks/svc-k1", params={"root": str(root)})
+    status = response.json()
+    assert status["interrupted"] is True
+    assert status["interrupt"] is None
+    assert status["interrupt_payload_unavailable"] is True
+    assert status["pending_interrupt_node"] == "human_approval_G1"

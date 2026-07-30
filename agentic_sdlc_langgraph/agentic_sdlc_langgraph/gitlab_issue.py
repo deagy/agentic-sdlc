@@ -38,6 +38,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -45,6 +46,72 @@ from urllib.parse import quote
 GITLAB_ISSUE_URI = re.compile(
     r"^gitlab-issue:(?P<project_path>[A-Za-z0-9_./-]+):issues/(?P<iid>\d+)$"
 )
+
+# Mocking convention for `requirement_issues.py`'s four GitLab-write/search
+# functions below, mirroring `AGENTIC_SDLC_TEST_GITLAB_ISSUE_FILE` /
+# `AGENTIC_SDLC_TEST_GITHUB_REVIEWS_FILE`. Unlike those (one call, one
+# fixed response), a `create-requirement-issues` run makes several distinct
+# calls (identity check, per-item search, per-item create, per-item
+# verification fetch) against one shared mock file, so the file is a single
+# JSON object multiplexing all of them:
+#
+#   {
+#     "identity": {"username": "svc-agentic-sdlc"},
+#     "search": {"<labels joined by ',' in call order>": [ <raw issue>, ... ]},
+#     "create": {"<labels joined by ',' in call order>": {"iid": 57, ...}},
+#     "verify": {"<iid as string>": { <raw glab `issues/:iid` response> }}
+#   }
+#
+# `search`/`create` are keyed by the exact `",".join(labels)` string the
+# caller passed (`requirement_issues.py` always calls both with
+# `[FIXED_LABEL, ITEM_LABEL]`, in that order, so tests can predict the
+# key). `verify`'s raw response is run through the same
+# raw-response-to-verification-shape extraction as a real `glab api`
+# response would be -- the mock only replaces "how did we obtain the raw
+# JSON", never the extraction logic, matching this module's existing
+# `fetch_gitlab_issue` convention.
+ISSUE_CREATE_MOCK_ENV_VAR = "AGENTIC_SDLC_TEST_ISSUE_CREATE_FILE"
+
+_GLAB_TIMEOUT_SECONDS = 30
+
+
+def _load_issue_create_mock() -> dict[str, Any] | None:
+    mock_path = os.environ.get(ISSUE_CREATE_MOCK_ENV_VAR)
+    if not mock_path:
+        return None
+    payload = json.loads(Path(mock_path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{ISSUE_CREATE_MOCK_ENV_VAR} must contain a JSON object")
+    return payload
+
+
+def _run_glab(argv: list[str], *, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    # Explicit cwd in a private neutral temp dir so no git remote in this
+    # repo's own cwd is ever discoverable by `glab` porcelain; explicit
+    # timeout, argv list (never shell=True), no secrets on argv.
+    with tempfile.TemporaryDirectory(prefix="agentic-sdlc-glab-") as cwd:
+        try:
+            return subprocess.run(
+                argv,
+                cwd=cwd,
+                input=input_bytes,
+                capture_output=True,
+                timeout=_GLAB_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise _glab_launch_error(argv, "timed out", exc) from exc
+        except OSError as exc:
+            # Covers FileNotFoundError (glab not installed/on PATH) and
+            # any other failure to launch the subprocess. Deliberately
+            # does not include `cwd` (a private temp directory path) in
+            # the message.
+            raise _glab_launch_error(argv, "failed to start", exc) from exc
+
+
+def _glab_launch_error(argv: list[str], verb: str, exc: BaseException) -> ValueError:
+    command = " ".join(argv[:2]) if len(argv) >= 2 else (argv[0] if argv else "glab")
+    return ValueError(f"`{command}` {verb}: {exc.__class__.__name__} -- is glab installed and reachable?")
 
 
 def parse_gitlab_issue_uri(value: str) -> dict[str, str] | None:
@@ -124,3 +191,207 @@ def resolve_issue_reference(value: str | None) -> str | None:
         raise ValueError(f"GitLab issue reference must be in <project-path>#<iid> form, got {value!r}")
     issue = fetch_gitlab_issue(project_path, int(iid_text))
     return gitlab_issue_uri(project_path, issue["iid"])
+
+
+# --------------------------------------------------------------------------
+# `create-requirement-issues` GitLab calls (requirement_issues.py). See
+# `ISSUE_CREATE_MOCK_ENV_VAR`'s docstring above for the shared mock-file
+# shape. Deliberately separate from `fetch_gitlab_issue`/its callers above:
+# see `fetch_gitlab_issue_verification`'s own docstring for why it is not a
+# widening of `fetch_gitlab_issue`.
+# --------------------------------------------------------------------------
+
+
+def verify_gitlab_identity(expected_username: str) -> str:
+    """Call `glab api user`, assert the authenticated `username` matches
+    `expected_username` case-insensitively. Raises `ValueError` on
+    mismatch or any subprocess/parse failure. Returns the verified
+    username on success -- callers use this, not `expected_username`
+    itself, as the recorded/compared identity from here on, since it is
+    the one actually confirmed against the live credential."""
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("identity")
+        if not isinstance(raw, dict):
+            raise ValueError(f"mocked {ISSUE_CREATE_MOCK_ENV_VAR} response has no 'identity' object")
+    else:
+        result = _run_glab(["glab", "api", "user"])
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+            raise ValueError(f"unable to verify GitLab identity: {detail}")
+        raw = json.loads(result.stdout)
+        if not isinstance(raw, dict):
+            raise ValueError("GitLab user API response must be a JSON object")
+
+    username = raw.get("username")
+    if not isinstance(username, str) or not username:
+        raise ValueError("GitLab user API response is missing a username")
+    if username.lower() != expected_username.lower():
+        raise ValueError(
+            f"authenticated GitLab identity {username!r} does not match required bot identity "
+            f"{expected_username!r} -- point your glab credential config at the bot's credentials"
+        )
+    return username
+
+
+def search_gitlab_issues_by_labels(project_path: str, labels: list[str]) -> list[dict[str, Any]]:
+    """`GET projects/<enc>/issues?labels=<...>&state=all&per_page=20`.
+
+    `state=all` is required -- omitting it defaults to open-only and would
+    cause a duplicate create against an already-reused-but-closed issue.
+    Label filter only -- never GitLab's free-text `search=` parameter,
+    which matches model-controlled body text and would reopen the exact
+    forgery vector the label anchor exists to close.
+    """
+    key = ",".join(labels)
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("search", {}).get(key, [])
+        if not isinstance(raw, list):
+            raise ValueError(f"mocked search response for labels {key!r} must be a JSON array")
+        return raw
+
+    encoded_project = quote(project_path, safe="")
+    label_param = quote(key, safe="")
+    result = _run_glab(
+        ["glab", "api", f"projects/{encoded_project}/issues?labels={label_param}&state=all&per_page=20"]
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+        raise ValueError(f"unable to search GitLab issues in {project_path} for labels {labels}: {detail}")
+    raw = json.loads(result.stdout)
+    if not isinstance(raw, list):
+        raise ValueError("GitLab issue search response must be a JSON array")
+    return raw
+
+
+def create_gitlab_issue(project_path: str, title: str, description: str, labels: list[str]) -> int:
+    """`POST projects/<enc>/issues`, request body from a temp file.
+
+    `glab api` mirrors `gh api`'s `--input <file>` convention (verified at
+    implementation time against `glab`'s own CLI help where possible; see
+    the task report for what this environment could and could not verify
+    directly, since no `glab` binary was available to probe). The body is
+    written to a 0600 file inside a private `mkdtemp` directory (POSIX
+    `mkdtemp` already creates it `0700`), unlinked in a `finally` block --
+    never passed via argv string. Returns the created issue's `iid`.
+    """
+    key = ",".join(labels)
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("create", {}).get(key)
+        if not isinstance(raw, dict):
+            raise ValueError(f"mocked create response for labels {key!r} must be a JSON object")
+    else:
+        encoded_project = quote(project_path, safe="")
+        body = json.dumps({"title": title, "description": description, "labels": labels}).encode("utf-8")
+        tmp_dir = tempfile.mkdtemp(prefix="agentic-sdlc-glab-create-")
+        try:
+            fd, body_path = tempfile.mkstemp(dir=tmp_dir, prefix="issue-body-", suffix=".json")
+            try:
+                os.write(fd, body)
+            finally:
+                os.close(fd)
+            os.chmod(body_path, 0o600)
+            argv = [
+                "glab", "api", f"projects/{encoded_project}/issues",
+                "--method", "POST", "--input", body_path,
+            ]
+            try:
+                result = subprocess.run(
+                    argv,
+                    cwd=tmp_dir,
+                    capture_output=True,
+                    timeout=_GLAB_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                # Deliberately raised inside the `finally`-protected block
+                # above (body file is still cleaned up either way) and
+                # deliberately does not mention `body_path`/`tmp_dir`.
+                raise _glab_launch_error(["glab", "api"], "timed out", exc) from exc
+            except OSError as exc:
+                raise _glab_launch_error(["glab", "api"], "failed to start", exc) from exc
+        finally:
+            for entry in Path(tmp_dir).glob("issue-body-*"):
+                entry.unlink(missing_ok=True)
+            Path(tmp_dir).rmdir()
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+            raise ValueError(f"unable to create GitLab issue in {project_path}: {detail}")
+        raw = json.loads(result.stdout)
+        if not isinstance(raw, dict):
+            raise ValueError("GitLab issue create response must be a JSON object")
+
+    iid = raw.get("iid")
+    if not isinstance(iid, int):
+        raise ValueError("GitLab issue create response is missing an integer 'iid'")
+    return iid
+
+
+def fetch_gitlab_issue_verification(project_path: str, iid: int) -> dict[str, Any]:
+    """Deliberately a SEPARATE function from `fetch_gitlab_issue`, not a
+    widening of it. `fetch_gitlab_issue`'s docstring records a deliberate
+    minimization decision (no author/assignee identity is ever read,
+    because a source-link fetch has no approver concept to protect
+    against). Widening that function in place would silently repeal that
+    decision for its existing callers. This function returns exactly what
+    post-creation verification needs and nothing more:
+    `{iid, title, state, labels, assignee_count, confidential,
+    project_path, author_username, web_url}`. `assignee_count` is an int
+    (whether assignees exist), never assignee identities.
+    `author_username` exists solely to verify the bot-identity control
+    per-issue, and is itself a machine identity the operator supplied.
+
+    The mocked path and the real (`glab api`) path share the exact same
+    raw-response-to-verification-shape extraction below -- the mock only
+    replaces "how did we obtain the raw JSON", matching this module's
+    `fetch_gitlab_issue` convention.
+    """
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("verify", {}).get(str(iid))
+        if not isinstance(raw, dict):
+            raise ValueError(f"mocked verification response for iid {iid} must be a JSON object")
+    else:
+        encoded_project = quote(project_path, safe="")
+        result = _run_glab(["glab", "api", f"projects/{encoded_project}/issues/{iid}"])
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+            raise ValueError(
+                f"unable to fetch GitLab issue verification for {project_path} issue {iid}: {detail}"
+            )
+        raw = json.loads(result.stdout)
+        if not isinstance(raw, dict):
+            raise ValueError("GitLab issue verification response must be a JSON object")
+
+    labels = raw.get("labels")
+    labels = list(labels) if isinstance(labels, list) else []
+    assignees = raw.get("assignees")
+    assignee_count = len(assignees) if isinstance(assignees, list) else 0
+    author = raw.get("author")
+    author_username = author.get("username") if isinstance(author, dict) else None
+
+    # Real GitLab issue responses have no direct "project_path" field;
+    # derive it from `references.full` ("group/project#57"). Mocked
+    # fixtures may supply "project_path" directly for readability -- both
+    # are honored, direct field wins if present.
+    project_path_field = raw.get("project_path")
+    if project_path_field is None:
+        references = raw.get("references")
+        if isinstance(references, dict):
+            full_ref = references.get("full")
+            if isinstance(full_ref, str) and "#" in full_ref:
+                project_path_field = full_ref.rsplit("#", 1)[0]
+
+    return {
+        "iid": iid,
+        "title": raw.get("title"),
+        "state": raw.get("state"),
+        "labels": labels,
+        "assignee_count": assignee_count,
+        "confidential": bool(raw.get("confidential", False)),
+        "project_path": project_path_field,
+        "author_username": author_username,
+        "web_url": raw.get("web_url"),
+    }

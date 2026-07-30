@@ -30,7 +30,7 @@ from typing import Any
 
 from langgraph.types import Command
 
-from . import runtime
+from . import requirement_issues, runtime
 from .contracts import load_lifecycle_gates
 from .export import export_run_record
 from .gitlab_issue import resolve_issue_reference
@@ -243,6 +243,66 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_create_requirement_issues(args: argparse.Namespace) -> int:
+    """GitLab-only Stage A requirement-item -> issue publisher. Reuses
+    `build_graph_for_task` only to read live gate/eligibility state (never
+    to dispatch anything) -- see `requirement_issues.run`'s docstring for
+    why the live-state read is a callback rather than an import."""
+    root = Path(args.root)
+    built = _rebuild(root, args.task_id)
+    if built is None:
+        return 1
+    graph, config, metadata = built
+    gate_id = "G2"
+
+    def get_eligibility() -> requirement_issues.Eligibility:
+        snapshot = graph.get_state(config)
+        values = snapshot.values or {}
+        gate = values.get("lifecycle_gates", {}).get(gate_id)
+        return requirement_issues.Eligibility(
+            run_halted=bool(values.get("run_halted", False)),
+            required_reentry_gate=gate.get("required_reentry_gate") if gate else None,
+            gate_status=gate.get("status") if gate else "pending",
+            re_entry_count=len(values.get("re_entry_history", [])),
+            classification=values.get("classification"),
+        )
+
+    try:
+        result = requirement_issues.run(
+            root=root,
+            task_id=args.task_id,
+            project=args.project,
+            items_source=args.items,
+            as_bot=args.as_bot,
+            apply=args.apply,
+            plan_digest=args.plan_digest,
+            allow_classification=args.allow_classification,
+            max_items=args.max_items,
+            break_lock=args.break_lock,
+            i_know_this_is_mocked=args.i_know_this_is_mocked,
+            get_eligibility=get_eligibility,
+        )
+    except requirement_issues.RequirementIssuesBlocked as exc:
+        _error(str(exc))
+        return 2
+    except requirement_issues.RequirementIssuesError as exc:
+        _error(str(exc))
+        return 1
+
+    _print(result)
+    return 0
+
+
+def cmd_list_requirement_issues(args: argparse.Namespace) -> int:
+    """Reads the sidecar ledger file directly -- must NOT rebuild the
+    graph / call `build_graph_for_task` (the ledger, not the checkpoint,
+    is what this command reports on)."""
+    root = Path(args.root)
+    ledger = requirement_issues.read_ledger(root, args.task_id)
+    _print(ledger)
+    return 0
+
+
 # --------------------------------------------------------------------------
 # argparse wiring
 # --------------------------------------------------------------------------
@@ -308,6 +368,41 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p.add_argument("--root", required=True)
     validate_p.add_argument("--task-id", required=True)
     validate_p.set_defaults(func=cmd_validate)
+
+    create_issues_p = sub.add_parser(
+        "create-requirement-issues",
+        help="Publish a G2 Requirements Baseline item list as GitLab issues (Stage A, GitLab-only).",
+    )
+    create_issues_p.add_argument("--root", required=True)
+    create_issues_p.add_argument("--task-id", required=True)
+    create_issues_p.add_argument("--project", required=True, help="GitLab project path, e.g. group/project")
+    create_issues_p.add_argument("--items", required=True, help="Path to the items JSON file, or '-' for stdin")
+    create_issues_p.add_argument(
+        "--as-bot", required=True, help="Required GitLab bot/machine username; verified via `glab api user`"
+    )
+    mode_group = create_issues_p.add_mutually_exclusive_group()
+    mode_group.add_argument("--dry-run", dest="apply", action="store_false", help="Default: print the plan digest only")
+    mode_group.add_argument("--apply", dest="apply", action="store_true", help="Actually create/reuse issues")
+    create_issues_p.set_defaults(apply=False)
+    create_issues_p.add_argument("--plan-digest", default=None, help="Required with --apply (from a prior --dry-run)")
+    create_issues_p.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's state classification -- no default, no ordering/threshold logic",
+    )
+    create_issues_p.add_argument("--max-items", type=int, default=requirement_issues.DEFAULT_MAX_ITEMS)
+    create_issues_p.add_argument("--break-lock", action="store_true", help="Explicitly override a held lock file")
+    create_issues_p.add_argument(
+        "--i-know-this-is-mocked", action="store_true",
+        help="Required alongside --apply whenever AGENTIC_SDLC_TEST_ISSUE_CREATE_FILE is set",
+    )
+    create_issues_p.set_defaults(func=cmd_create_requirement_issues)
+
+    list_issues_p = sub.add_parser(
+        "list-requirement-issues", help="Print the requirement-issues sidecar ledger for a task."
+    )
+    list_issues_p.add_argument("--root", required=True)
+    list_issues_p.add_argument("--task-id", required=True)
+    list_issues_p.set_defaults(func=cmd_list_requirement_issues)
 
     return parser
 

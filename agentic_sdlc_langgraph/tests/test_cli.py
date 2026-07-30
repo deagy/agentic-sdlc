@@ -256,6 +256,34 @@ def test_invalidate_rejects_gate_outside_sequence(tmp_path: Path, capsys):
     assert "G7" in err
 
 
+def test_status_reports_pending_interrupt_after_invalidate(tmp_path: Path, capsys):
+    """K1 fix: `invalidate` calls `graph.update_state(...)`, which empties
+    `snapshot.interrupts` while the graph stays genuinely suspended at
+    `human_approval_G1`. `status` must still report that."""
+    root = str(tmp_path)
+    _run_cli(["plan", "--root", root, "--task-id", "t1", "--task", TASK_TEXT], capsys)
+
+    _run_cli(
+        [
+            "invalidate",
+            "--root", root,
+            "--task-id", "t1",
+            "--earliest-gate", "G1",
+            "--reason", "requirements changed",
+            "--actor", "tester",
+        ],
+        capsys,
+    )
+
+    code, out, _err = _run_cli(["status", "--root", root, "--task-id", "t1"], capsys)
+    assert code == 0
+    status = json.loads(out)
+    assert status["interrupted"] is True
+    assert status["interrupt"] is None
+    assert status["interrupt_payload_unavailable"] is True
+    assert status["pending_interrupt_node"] == "human_approval_G1"
+
+
 def test_resume_decision_from_stdin(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch):
     root = str(tmp_path)
     _run_cli(["plan", "--root", root, "--task-id", "t1", "--task", TASK_TEXT], capsys)

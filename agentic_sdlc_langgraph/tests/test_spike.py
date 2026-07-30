@@ -593,6 +593,107 @@ def test_mutation_gate_hard_interrupt_halts_run_when_rejected(contracts):
         assert gate["applicability"] == "applicable"
 
 
+def test_build_graph_topology_unaffected_by_classification_payload_addition(contracts):
+    """Regression pin: `dispatch_authors_{gate}`/`dispatch_reviewers_{gate}`
+    now also pass a `classification` key in each `Send` payload, but that
+    is a payload-content-only change -- node/edge topology (names, count,
+    conditional-ness) must stay exactly what it was before that change."""
+    graph = _make_graph(contracts)
+    drawable = graph.get_graph()
+
+    expected_nodes = {
+        "__start__",
+        "__end__",
+        "mutation_gate_check",
+        "dispatch_authors_G1",
+        "dispatch_reviewers_G1",
+        "G1_author_product-intent-agent",
+        "G1_reviewer_code-reviewer",
+        "gate_decision_G1",
+        "human_approval_G1",
+        "dispatch_authors_G2",
+        "dispatch_reviewers_G2",
+        "G2_author_requirements-agent",
+        "G2_reviewer_code-reviewer",
+        "gate_decision_G2",
+        "human_approval_G2",
+        "dispatch_authors_G3",
+        "dispatch_reviewers_G3",
+        "G3_author_cloud-architect",
+        "G3_reviewer_code-reviewer",
+        "gate_decision_G3",
+        "human_approval_G3",
+    }
+    assert set(drawable.nodes.keys()) == expected_nodes
+
+    edges = {(edge.source, edge.target, edge.conditional) for edge in drawable.edges}
+    expected_edges = {
+        ("__start__", "mutation_gate_check", False),
+        ("mutation_gate_check", "__end__", True),
+        ("mutation_gate_check", "dispatch_authors_G1", True),
+        ("dispatch_authors_G1", "G1_author_product-intent-agent", True),
+        ("dispatch_authors_G1", "dispatch_reviewers_G1", True),
+        ("G1_author_product-intent-agent", "dispatch_reviewers_G1", False),
+        ("dispatch_reviewers_G1", "G1_reviewer_code-reviewer", True),
+        ("dispatch_reviewers_G1", "gate_decision_G1", True),
+        ("G1_reviewer_code-reviewer", "gate_decision_G1", False),
+        ("gate_decision_G1", "human_approval_G1", False),
+        ("human_approval_G1", "dispatch_authors_G2", False),
+        ("dispatch_authors_G2", "G2_author_requirements-agent", True),
+        ("dispatch_authors_G2", "dispatch_reviewers_G2", True),
+        ("G2_author_requirements-agent", "dispatch_reviewers_G2", False),
+        ("dispatch_reviewers_G2", "G2_reviewer_code-reviewer", True),
+        ("dispatch_reviewers_G2", "gate_decision_G2", True),
+        ("G2_reviewer_code-reviewer", "gate_decision_G2", False),
+        ("gate_decision_G2", "human_approval_G2", False),
+        ("human_approval_G2", "dispatch_authors_G3", False),
+        ("dispatch_authors_G3", "G3_author_cloud-architect", True),
+        ("dispatch_authors_G3", "dispatch_reviewers_G3", True),
+        ("G3_author_cloud-architect", "dispatch_reviewers_G3", False),
+        ("dispatch_reviewers_G3", "G3_reviewer_code-reviewer", True),
+        ("dispatch_reviewers_G3", "gate_decision_G3", True),
+        ("G3_reviewer_code-reviewer", "gate_decision_G3", False),
+        ("gate_decision_G3", "human_approval_G3", False),
+        ("human_approval_G3", "__end__", False),
+    }
+    assert edges == expected_edges
+
+
+def test_human_approval_treats_non_dict_resume_decision_as_not_approved(contracts):
+    """`human_approval_{gate}` must fail closed (never 500) if resumed
+    with a non-dict decision, mirroring `mutation_gate_check`'s existing
+    isinstance guard."""
+    graph = _make_graph(contracts)
+    config = {"configurable": {"thread_id": "task-non-dict-decision"}}
+    initial_state = {
+        "task_id": "task-non-dict-decision",
+        "classification": "internal",
+        "scope": TASK_TEXT,
+        "current_lifecycle_phase": "intent",
+        "lifecycle_gates": {},
+        "re_entry_history": [],
+        "authorities": {
+            "product_owner": {"status": "assigned"},
+            "requirements_owner": {"status": "assigned"},
+            "architecture_owner": {"status": "assigned"},
+        },
+        "agent_outputs": {},
+        "mutation_gate_pending": None,
+        "mutation_gate_decision": None,
+        "run_halted": False,
+    }
+    graph.invoke(initial_state, config=config)
+
+    result = graph.invoke(Command(resume="yes"), config=config)
+
+    assert "__interrupt__" in result
+    state = graph.get_state(config).values
+    approval = state["lifecycle_gates"]["G1"]["human_approvals"][-1]
+    assert approval["status"] in ("rejected", "pending")
+    assert approval["approver"] is None
+    assert approval["evidence_refs"] == []
+
+
 def test_mutation_gate_never_fires_for_ordinary_task(contracts):
     graph = _make_mutation_graph(contracts)
     config = {"configurable": {"thread_id": "task-mutation-ordinary"}}

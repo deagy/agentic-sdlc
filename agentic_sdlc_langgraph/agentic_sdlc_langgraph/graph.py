@@ -223,8 +223,12 @@ def build_graph(
                 if not author_ids:
                     return f"dispatch_reviewers_{gate_id}"
                 task_text = state.get("scope", "")
+                classification = state.get("classification", "internal")
                 return [
-                    Send(f"{gate_id}_author_{agent_id}", {"gate_id": gate_id, "task_text": task_text})
+                    Send(
+                        f"{gate_id}_author_{agent_id}",
+                        {"gate_id": gate_id, "task_text": task_text, "classification": classification},
+                    )
                     for agent_id in author_ids
                 ]
 
@@ -266,8 +270,12 @@ def build_graph(
                 if not reviewer_ids:
                     return f"gate_decision_{gate_id}"
                 task_text = state.get("scope", "")
+                classification = state.get("classification", "internal")
                 return [
-                    Send(f"{gate_id}_reviewer_{agent_id}", {"gate_id": gate_id, "task_text": task_text})
+                    Send(
+                        f"{gate_id}_reviewer_{agent_id}",
+                        {"gate_id": gate_id, "task_text": task_text, "classification": classification},
+                    )
                     for agent_id in reviewer_ids
                 ]
 
@@ -377,11 +385,12 @@ def build_graph(
                 # forces the human_approvals entry to "rejected" (never
                 # "approved"), while the richer "blocked" outcome is recorded
                 # on the gate itself, not on the approval record.
+                decision_is_dict = isinstance(decision, dict)
                 if violation:
                     approval_status = "rejected"
                     gate_status = "blocked"
                 else:
-                    raw_status = decision.get("status", "pending")
+                    raw_status = decision.get("status", "pending") if decision_is_dict else "pending"
                     if raw_status in ("approved", "rejected", "pending", "not-required"):
                         approval_status = raw_status
                     else:
@@ -391,9 +400,9 @@ def build_graph(
                     )
                 approval = {
                     "status": approval_status,
-                    "approver": decision.get("approver"),
+                    "approver": decision.get("approver") if decision_is_dict else None,
                     "decided_at": _now(),
-                    "evidence_refs": decision.get("evidence_refs", []),
+                    "evidence_refs": decision.get("evidence_refs", []) if decision_is_dict else [],
                 }
                 new_gate["human_approvals"] = current.get("human_approvals", []) + [approval]
                 new_gate["decided_at"] = approval["decided_at"]

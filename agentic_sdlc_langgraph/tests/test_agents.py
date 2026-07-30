@@ -26,9 +26,11 @@ from agentic_sdlc_langgraph.agents import (
     ASK_HUMAN_RULE,
     OpenAICompatibleModelClient,
     SUBMIT_CONTRIBUTION_TOOL_NAME,
+    make_agent_node,
     resolve_role_prompt,
 )
 from agentic_sdlc_langgraph.graph import build_graph
+from agentic_sdlc_langgraph.provider import fingerprint
 
 
 def test_resolve_role_prompt_uses_rich_definition_when_profile_opts_in(tmp_path):
@@ -125,24 +127,10 @@ class _RecordingModelClient:
 
     def complete(self, *, agent_id, kind, gate_id, role_prompt, task_text):
         self.seen_role_prompts[agent_id] = role_prompt
-        digest_filler = "0" * 64
         return {
-            "agent_id": agent_id,
-            "kind": kind,
-            "gate_id": gate_id,
-            "identity": {"id": agent_id, "role": f"{kind}:{agent_id}", "kind": "agent"},
-            "artifact_binding": {
-                "artifact_id": f"{gate_id}-{agent_id}-artifact",
-                "revision": "rev-1",
-                "digest": f"sha256:{digest_filler}",
-            },
-            "evidence_ref": {
-                "evidence_id": f"{gate_id}-{agent_id}-evidence",
-                "uri": f"fake://evidence/{gate_id}/{agent_id}",
-                "hash_algorithm": "sha256",
-                "hash": digest_filler,
-                "classification": "internal",
-            },
+            "artifact_id": f"{gate_id}-{agent_id}-artifact",
+            "revision": "rev-1",
+            "summary": f"{agent_id} completed its {kind} contribution for {gate_id}",
             "blocking_question": None,
         }
 
@@ -269,7 +257,7 @@ def test_openai_compatible_model_client_builds_agent_output_from_tool_call():
     client = OpenAICompatibleModelClient(model="gpt-4o-mini")
     client._client = lambda: fake_client
 
-    output = client.complete(
+    contribution = client.complete(
         agent_id="some-agent",
         kind="author",
         gate_id="G1",
@@ -277,13 +265,13 @@ def test_openai_compatible_model_client_builds_agent_output_from_tool_call():
         task_text="Do the thing.",
     )
 
-    assert output["agent_id"] == "some-agent"
-    assert output["kind"] == "author"
-    assert output["gate_id"] == "G1"
-    assert output["artifact_binding"]["artifact_id"] == "artifact-42"
-    assert output["artifact_binding"]["revision"] == "rev-7"
-    assert output["evidence_ref"]["uri"] == "openai://response/G1/some-agent"
-    assert output["blocking_question"] is None
+    # OpenAICompatibleModelClient.complete now returns an AgentContribution
+    # only -- agent_id/kind/gate_id/identity/evidence_ref are constructed
+    # by make_agent_node, never from the client's own return value.
+    assert contribution["artifact_id"] == "artifact-42"
+    assert contribution["revision"] == "rev-7"
+    assert contribution["summary"] == "Did the thing."
+    assert contribution["blocking_question"] is None
 
     assert fake_client.received_kwargs["model"] == "gpt-4o-mini"
     assert fake_client.received_kwargs["messages"][0] == {"role": "system", "content": "You are some-agent."}
@@ -305,7 +293,7 @@ def test_openai_compatible_model_client_surfaces_blocking_question():
     client = OpenAICompatibleModelClient(model="gpt-4o-mini")
     client._client = lambda: fake_client
 
-    output = client.complete(
+    contribution = client.complete(
         agent_id="some-agent",
         kind="reviewer",
         gate_id="G3",
@@ -313,19 +301,19 @@ def test_openai_compatible_model_client_surfaces_blocking_question():
         task_text="Review the thing.",
     )
 
-    assert output["blocking_question"] == "Which auth provider should this use?"
+    assert contribution["blocking_question"] == "Which auth provider should this use?"
 
 
 def test_openai_compatible_model_client_falls_back_when_tool_not_called():
     """If the model returns no matching tool call (e.g. an unexpected or
-    empty response), the client still returns a well-formed `AgentOutput`
-    using the same defaults `AnthropicModelClient` falls back to, rather
-    than raising."""
+    empty response), the client still returns a well-formed
+    `AgentContribution` using the same defaults `AnthropicModelClient`
+    falls back to, rather than raising."""
     fake_client = _FakeOpenAIClient(None)
     client = OpenAICompatibleModelClient(model="gpt-4o-mini")
     client._client = lambda: fake_client
 
-    output = client.complete(
+    contribution = client.complete(
         agent_id="some-agent",
         kind="author",
         gate_id="G1",
@@ -333,9 +321,9 @@ def test_openai_compatible_model_client_falls_back_when_tool_not_called():
         task_text="Do the thing.",
     )
 
-    assert output["artifact_binding"]["artifact_id"] == "G1-some-agent-artifact"
-    assert output["artifact_binding"]["revision"] == "rev-1"
-    assert output["blocking_question"] is None
+    assert contribution["artifact_id"] == "G1-some-agent-artifact"
+    assert contribution["revision"] == "rev-1"
+    assert contribution["blocking_question"] is None
 
 
 def test_openai_compatible_model_client_falls_back_on_malformed_tool_arguments():
@@ -348,7 +336,7 @@ def test_openai_compatible_model_client_falls_back_on_malformed_tool_arguments()
     client = OpenAICompatibleModelClient(model="gpt-4o-mini")
     client._client = lambda: fake_client
 
-    output = client.complete(
+    contribution = client.complete(
         agent_id="some-agent",
         kind="author",
         gate_id="G1",
@@ -356,9 +344,9 @@ def test_openai_compatible_model_client_falls_back_on_malformed_tool_arguments()
         task_text="Do the thing.",
     )
 
-    assert output["artifact_binding"]["artifact_id"] == "G1-some-agent-artifact"
-    assert output["artifact_binding"]["revision"] == "rev-1"
-    assert output["blocking_question"] is None
+    assert contribution["artifact_id"] == "G1-some-agent-artifact"
+    assert contribution["revision"] == "rev-1"
+    assert contribution["blocking_question"] is None
 
 
 def test_openai_compatible_model_client_reads_api_key_and_base_url_from_env(monkeypatch):
@@ -405,3 +393,198 @@ def test_openai_compatible_model_client_explicit_fields_override_env(monkeypatch
 
     assert captured["api_key"] == "explicit-key"
     assert captured["base_url"] == "https://self-hosted.invalid/v1"
+
+
+@dataclass
+class _MaliciousModelClient:
+    """Returns a fixed `AgentContribution` (with intentionally hostile
+    field values) regardless of the args -- used to prove
+    `make_agent_node` sanitizes/validates a client's return value rather
+    than trusting it, and that a client can no longer forge the
+    dispatch-identity fields it used to be allowed to return directly."""
+
+    contribution: dict
+
+    def complete(self, *, agent_id, kind, gate_id, role_prompt, task_text):
+        return dict(self.contribution)
+
+
+def test_make_agent_node_rejects_empty_artifact_fields_and_falls_back():
+    client = _MaliciousModelClient({"artifact_id": "", "revision": "", "summary": "s", "blocking_question": None})
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+    assert binding["revision"] == "rev-1"
+
+
+def test_make_agent_node_rejects_artifact_id_with_newline_and_falls_back():
+    client = _MaliciousModelClient(
+        {"artifact_id": "line1\nline2", "revision": "rev-1", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+
+
+def test_make_agent_node_rejects_artifact_id_with_null_byte_and_falls_back():
+    client = _MaliciousModelClient(
+        {"artifact_id": "artifact\x00hidden", "revision": "rev-1", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+
+
+def test_make_agent_node_rejects_artifact_id_with_unit_separator_control_char_and_falls_back():
+    client = _MaliciousModelClient(
+        {"artifact_id": "artifact\x1fhidden", "revision": "rev-1", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+
+
+def test_make_agent_node_rejects_artifact_id_with_unicode_format_character_and_falls_back():
+    """Unicode `Cf`-category format characters (e.g. a zero-width space or
+    the right-to-left override) are a display-spoofing risk once this
+    flows into the exported run record -- `_sanitized_artifact_field`
+    must reject them, not just ASCII C0/DEL controls."""
+    client = _MaliciousModelClient(
+        {
+            "artifact_id": "artifact​-hidden‮",
+            "revision": "rev-1",
+            "summary": "s",
+            "blocking_question": None,
+        }
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+
+
+def test_make_agent_node_rejects_non_string_artifact_fields_and_falls_back():
+    client = _MaliciousModelClient(
+        {"artifact_id": 12345, "revision": {"nested": "dict"}, "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+    assert binding["revision"] == "rev-1"
+
+
+def test_make_agent_node_rejects_oversized_artifact_id_and_falls_back():
+    client = _MaliciousModelClient(
+        {"artifact_id": "x" * 201, "revision": "rev-1", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "G1-some-agent-artifact"
+
+
+def test_make_agent_node_accepts_well_formed_artifact_fields():
+    client = _MaliciousModelClient(
+        {"artifact_id": "real-artifact-1", "revision": "rev-9", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    binding = update["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]
+
+    assert binding["artifact_id"] == "real-artifact-1"
+    assert binding["revision"] == "rev-9"
+
+
+def test_make_agent_node_identity_kind_is_always_agent_even_if_contribution_tries_otherwise():
+    """`AgentContribution` has no `identity`/`kind` field a client could
+    even attempt to set -- `identity.kind` is hardcoded to `"agent"` by
+    `make_agent_node` regardless of any (hypothetically malformed)
+    client return value, since a `"human"` identity may only originate
+    from `human_approval_{gate}`'s resume payload."""
+    client = _MaliciousModelClient(
+        {
+            "artifact_id": "artifact-1",
+            "revision": "rev-1",
+            "summary": "s",
+            "blocking_question": None,
+            # extraneous keys a malformed/malicious client might add --
+            # AgentContribution's TypedDict shape doesn't stop a real dict
+            # at runtime, so make_agent_node must ignore them entirely.
+            "identity": {"id": "some-agent", "role": "human", "kind": "human"},
+            "gate_id": "G5",
+            "agent_id": "some-agent",
+        }
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    output = update["agent_outputs"]["G1:author:some-agent"]
+
+    assert output["identity"]["kind"] == "agent"
+    assert output["gate_id"] == "G1"
+    assert output["agent_id"] == "some-agent"
+
+
+def test_make_agent_node_digest_scoped_to_artifact_id_and_revision_only():
+    """The binding digest attests self-consistency of artifact_id +
+    revision, not content -- it must not change if `summary` changes,
+    since `summary` never survives to the exported run record."""
+    client_a = _MaliciousModelClient(
+        {"artifact_id": "artifact-1", "revision": "rev-1", "summary": "summary A", "blocking_question": None}
+    )
+    client_b = _MaliciousModelClient(
+        {"artifact_id": "artifact-1", "revision": "rev-1", "summary": "a wildly different summary", "blocking_question": None}
+    )
+
+    output_a = make_agent_node("some-agent", "author", client_a)({"gate_id": "G1", "task_text": "t"})
+    output_b = make_agent_node("some-agent", "author", client_b)({"gate_id": "G1", "task_text": "t"})
+
+    digest_a = output_a["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]["digest"]
+    digest_b = output_b["agent_outputs"]["G1:author:some-agent"]["artifact_binding"]["digest"]
+
+    assert digest_a == digest_b
+    assert digest_a == fingerprint({"artifact_id": "artifact-1", "revision": "rev-1"})
+
+
+def test_make_agent_node_classification_flows_from_payload_to_evidence_ref():
+    client = _MaliciousModelClient(
+        {"artifact_id": "artifact-1", "revision": "rev-1", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t", "classification": "restricted"})
+    evidence_ref = update["agent_outputs"]["G1:author:some-agent"]["evidence_ref"]
+
+    assert evidence_ref["classification"] == "restricted"
+
+
+def test_make_agent_node_classification_defaults_to_internal_when_absent_from_payload():
+    client = _MaliciousModelClient(
+        {"artifact_id": "artifact-1", "revision": "rev-1", "summary": "s", "blocking_question": None}
+    )
+    node = make_agent_node("some-agent", "author", client)
+
+    update = node({"gate_id": "G1", "task_text": "t"})
+    evidence_ref = update["agent_outputs"]["G1:author:some-agent"]["evidence_ref"]
+
+    assert evidence_ref["classification"] == "internal"

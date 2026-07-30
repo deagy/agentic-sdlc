@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, TypedDict
 
-from .provider import provider_resource
+from .provider import fingerprint, provider_resource
 
 
 class Identity(TypedDict):
@@ -57,6 +58,21 @@ class AgentOutput(TypedDict):
     blocking_question: str | None
 
 
+class AgentContribution(TypedDict):
+    """What a `ModelClient` is structurally allowed to return: its own
+    contribution content, never the sensitive dispatch-identity fields
+    (`agent_id`/`kind`/`gate_id`/`identity`/`evidence_ref`) that
+    `make_agent_node` alone is trusted to set. This closes a
+    cross-gate contribution-injection defect: a client could previously
+    return a whole `AgentOutput` with a forged `gate_id`, injecting
+    itself as another gate's independent verifier."""
+
+    artifact_id: str
+    revision: str
+    summary: str
+    blocking_question: str | None
+
+
 class ModelClient(Protocol):
     def complete(
         self,
@@ -66,7 +82,7 @@ class ModelClient(Protocol):
         gate_id: str,
         role_prompt: str,
         task_text: str,
-    ) -> AgentOutput:
+    ) -> AgentContribution:
         ...
 
 
@@ -191,26 +207,12 @@ class FakeModelClient:
         gate_id: str,
         role_prompt: str,
         task_text: str,
-    ) -> AgentOutput:
-        digest_filler = "0" * 64
+    ) -> AgentContribution:
         blocking = agent_id in self.blocking_agents
-        return AgentOutput(
-            agent_id=agent_id,
-            kind=kind,
-            gate_id=gate_id,
-            identity=Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent"),
-            artifact_binding=ArtifactBinding(
-                artifact_id=f"{gate_id}-{agent_id}-artifact",
-                revision="rev-1",
-                digest=f"sha256:{digest_filler}",
-            ),
-            evidence_ref=EvidenceRef(
-                evidence_id=f"{gate_id}-{agent_id}-evidence",
-                uri=f"fake://evidence/{gate_id}/{agent_id}",
-                hash_algorithm="sha256",
-                hash=digest_filler,
-                classification="internal",
-            ),
+        return AgentContribution(
+            artifact_id=f"{gate_id}-{agent_id}-artifact",
+            revision="rev-1",
+            summary=f"{agent_id} completed its {kind} contribution for {gate_id}",
             blocking_question=(
                 f"{agent_id} needs clarification before proceeding" if blocking else None
             ),
@@ -263,7 +265,7 @@ class AnthropicModelClient:
         gate_id: str,
         role_prompt: str,
         task_text: str,
-    ) -> AgentOutput:
+    ) -> AgentContribution:
         tool = {
             "name": SUBMIT_CONTRIBUTION_TOOL_NAME,
             "description": SUBMIT_CONTRIBUTION_DESCRIPTION,
@@ -283,24 +285,10 @@ class AnthropicModelClient:
             if getattr(block, "type", None) == "tool_use" and block.name == SUBMIT_CONTRIBUTION_TOOL_NAME:
                 payload = block.input
                 break
-        digest_filler = "0" * 64
-        return AgentOutput(
-            agent_id=agent_id,
-            kind=kind,
-            gate_id=gate_id,
-            identity=Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent"),
-            artifact_binding=ArtifactBinding(
-                artifact_id=payload.get("artifact_id", f"{gate_id}-{agent_id}-artifact"),
-                revision=payload.get("revision", "rev-1"),
-                digest=f"sha256:{digest_filler}",
-            ),
-            evidence_ref=EvidenceRef(
-                evidence_id=f"{gate_id}-{agent_id}-evidence",
-                uri=f"anthropic://response/{gate_id}/{agent_id}",
-                hash_algorithm="sha256",
-                hash=digest_filler,
-                classification="internal",
-            ),
+        return AgentContribution(
+            artifact_id=payload.get("artifact_id", f"{gate_id}-{agent_id}-artifact"),
+            revision=payload.get("revision", "rev-1"),
+            summary=payload.get("summary", ""),
             blocking_question=payload.get("blocking_question"),
         )
 
@@ -336,7 +324,7 @@ class OpenAICompatibleModelClient:
         gate_id: str,
         role_prompt: str,
         task_text: str,
-    ) -> AgentOutput:
+    ) -> AgentContribution:
         tool = {
             "type": "function",
             "function": {
@@ -372,24 +360,10 @@ class OpenAICompatibleModelClient:
                 if isinstance(parsed, dict):
                     payload = parsed
                 break
-        digest_filler = "0" * 64
-        return AgentOutput(
-            agent_id=agent_id,
-            kind=kind,
-            gate_id=gate_id,
-            identity=Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent"),
-            artifact_binding=ArtifactBinding(
-                artifact_id=payload.get("artifact_id", f"{gate_id}-{agent_id}-artifact"),
-                revision=payload.get("revision", "rev-1"),
-                digest=f"sha256:{digest_filler}",
-            ),
-            evidence_ref=EvidenceRef(
-                evidence_id=f"{gate_id}-{agent_id}-evidence",
-                uri=f"openai://response/{gate_id}/{agent_id}",
-                hash_algorithm="sha256",
-                hash=digest_filler,
-                classification="internal",
-            ),
+        return AgentContribution(
+            artifact_id=payload.get("artifact_id", f"{gate_id}-{agent_id}-artifact"),
+            revision=payload.get("revision", "rev-1"),
+            summary=payload.get("summary", ""),
             blocking_question=payload.get("blocking_question"),
         )
 
@@ -398,7 +372,7 @@ class OpenAICompatibleModelClient:
 class A2AModelClient:
     """Dispatches `.complete()` to one external, A2A-reachable agent
     (e.g. a Codex CLI agent) over `message/send`, translating the
-    returned `Task` back into an `AgentOutput` of the same shape
+    returned `Task` back into an `AgentContribution` of the same shape
     `AnthropicModelClient.complete` builds.
 
     Deliberately synchronous, single-shot (`message/send`, not
@@ -415,12 +389,13 @@ class A2AModelClient:
 
     endpoint: str
     client: Any = None  # A2AClient, lazily constructed if not supplied
+    timeout: float = 60.0
 
     def _a2a_client(self):
         from .a2a.client import A2AClient  # local import: avoid a hard dependency for callers that never use A2A
 
         if self.client is None:
-            self.client = A2AClient(self.endpoint)
+            self.client = A2AClient(self.endpoint, timeout=self.timeout)
         return self.client
 
     def complete(
@@ -431,32 +406,20 @@ class A2AModelClient:
         gate_id: str,
         role_prompt: str,
         task_text: str,
-    ) -> AgentOutput:
+    ) -> AgentContribution:
         task = self._a2a_client().send_message(f"{role_prompt}\n\n{task_text}")
-        digest_filler = "0" * 64
         blocking_question = None
         if task.status.state.value == "input-required":
             message = task.status.message
             blocking_question = (
                 message if isinstance(message, str) else f"{agent_id} needs clarification before proceeding"
             )
-        return AgentOutput(
-            agent_id=agent_id,
-            kind=kind,
-            gate_id=gate_id,
-            identity=Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent"),
-            artifact_binding=ArtifactBinding(
-                artifact_id=f"{gate_id}-{agent_id}-artifact",
-                revision="rev-1",
-                digest=f"sha256:{digest_filler}",
-            ),
-            evidence_ref=EvidenceRef(
-                evidence_id=f"{gate_id}-{agent_id}-evidence",
-                uri=f"a2a://{self.endpoint}/{task.id}",
-                hash_algorithm="sha256",
-                hash=digest_filler,
-                classification="internal",
-            ),
+        # `task.artifacts`/`task.history` aren't parsed here yet (new work,
+        # not this fix) -- summary stays a synthesized placeholder.
+        return AgentContribution(
+            artifact_id=f"{gate_id}-{agent_id}-artifact",
+            revision="rev-1",
+            summary=f"{agent_id} completed its {kind} contribution for {gate_id} via A2A task {task.id}",
             blocking_question=blocking_question,
         )
 
@@ -495,7 +458,7 @@ class DispatchingModelClient:
         gate_id: str,
         role_prompt: str,
         task_text: str,
-    ) -> AgentOutput:
+    ) -> AgentContribution:
         return self._client_for(agent_id).complete(
             agent_id=agent_id,
             kind=kind,
@@ -536,16 +499,63 @@ def make_agent_node(
     metadata = metadata or {}
     profile = profile or {}
 
+    def _sanitized_artifact_field(value: Any, default: str) -> str:
+        # Reject anything a model client can't be trusted to assert as
+        # real provenance: not a string, empty, containing a control or
+        # format character (C0/C1 controls, e.g. \n or \x00; Unicode
+        # format characters, e.g. zero-width space or RTL override -- a
+        # display-spoofing risk once this flows into the run record), or
+        # unreasonably long. Falls back to the existing default rather
+        # than raising.
+        if not isinstance(value, str) or not value or len(value) > 200:
+            return default
+        if any(unicodedata.category(char) in {"Cc", "Cf"} for char in value):
+            return default
+        return value
+
     def node(payload: dict[str, Any]) -> dict[str, Any]:
         gate_id = payload["gate_id"]
         task_text = payload.get("task_text", "")
+        classification = payload.get("classification", "internal")
         role_prompt = resolve_role_prompt(agent_id, kind, metadata, profile, provider_root=provider_root)
-        output = model_client.complete(
+        contribution = model_client.complete(
             agent_id=agent_id,
             kind=kind,
             gate_id=gate_id,
             role_prompt=role_prompt,
             task_text=task_text,
+        )
+
+        artifact_id = _sanitized_artifact_field(
+            contribution.get("artifact_id"), f"{gate_id}-{agent_id}-artifact"
+        )
+        revision = _sanitized_artifact_field(contribution.get("revision"), "rev-1")
+
+        # Digest attests self-consistency of the binding (artifact_id +
+        # revision), not content -- `summary` is discarded before export
+        # (run-record.schema.json has nowhere to retain it), so hashing it
+        # would be unverifiable and misleadingly look like real
+        # verification.
+        digest = fingerprint({"artifact_id": artifact_id, "revision": revision})
+        digest_hex = digest.removeprefix("sha256:")
+
+        identity = Identity(id=agent_id, role=f"{kind}:{agent_id}", kind="agent")
+        artifact_binding = ArtifactBinding(artifact_id=artifact_id, revision=revision, digest=digest)
+        evidence_ref = EvidenceRef(
+            evidence_id=f"{gate_id}-{agent_id}-evidence",
+            uri=f"agent-dispatch://{gate_id}/{agent_id}",
+            hash_algorithm="sha256",
+            hash=digest_hex,
+            classification=classification,
+        )
+        output = AgentOutput(
+            agent_id=agent_id,
+            kind=kind,
+            gate_id=gate_id,
+            identity=identity,
+            artifact_binding=artifact_binding,
+            evidence_ref=evidence_ref,
+            blocking_question=contribution.get("blocking_question"),
         )
         slot_key = f"{gate_id}:{kind}:{agent_id}"
         return {"agent_outputs": {slot_key: dict(output)}}

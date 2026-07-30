@@ -120,7 +120,7 @@ from .contracts import (
 from .export import _PHASE_BY_GATE_ID
 from .graph import build_graph
 from .planning import derive_gate_sequence
-from .provider import LoadedProvider, load_provider, merge_profile
+from .provider import LoadedProvider, fingerprint, load_provider, merge_profile
 
 # Root of *this* kernel checkout (contains `plugins/` and `providers/`) --
 # NOT the project root a CLI/service caller operates against (that's the
@@ -132,7 +132,7 @@ KERNEL_ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_DIR = KERNEL_ROOT / "plugins" / "agentic-sdlc" / "contracts"
 DEFAULT_PROVIDER_ROOT = KERNEL_ROOT / "providers" / "agentic-sdlc-defaults"
 
-GRAPH_CONFIG_SCHEMA_VERSION = 1
+GRAPH_CONFIG_SCHEMA_VERSION = 2
 
 # See module docstring: set to "1" to force FakeModelClient everywhere
 # `default_model_client()` is consulted (no network, fully deterministic).
@@ -244,6 +244,16 @@ class TaskGraphMetadata:
     ignored_gate_ids: list[str]
     gate_sequence_ids: list[str]
     created_at: str
+    # sha256 fingerprint (`provider.fingerprint`) of the agent catalog
+    # loaded at plan time, either via `load_provider` (explicit
+    # `--provider`) or `contracts.load_agent_catalog` (the default
+    # no-provider path) -- recomputed and compared at every later rebuild
+    # as a staleness tripwire (see `_load_contracts_and_profile`'s
+    # caller in `build_graph_for_task`). `None` only for a
+    # `graph-config.json` written before this field existed
+    # (schema_version < 2); such a config can't be retroactively
+    # verified, so the tripwire is skipped rather than raising.
+    agent_catalog_digest: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -255,6 +265,7 @@ class TaskGraphMetadata:
             "ignored_gate_ids": list(self.ignored_gate_ids),
             "gate_sequence_ids": list(self.gate_sequence_ids),
             "created_at": self.created_at,
+            "agent_catalog_digest": self.agent_catalog_digest,
         }
 
     @classmethod
@@ -267,6 +278,7 @@ class TaskGraphMetadata:
             ignored_gate_ids=list(payload.get("ignored_gate_ids", [])),
             gate_sequence_ids=list(payload.get("gate_sequence_ids", [])),
             created_at=payload.get("created_at", ""),
+            agent_catalog_digest=payload.get("agent_catalog_digest"),
         )
 
 
@@ -376,6 +388,7 @@ def build_graph_for_task(
             ignored_gate_ids=ignored_gate_ids,
             gate_sequence_ids=[g["id"] for g in sequence],
             created_at=_now(),
+            agent_catalog_digest=fingerprint(agent_catalog),
         )
         _write_graph_config(root, metadata)
     else:
@@ -397,6 +410,17 @@ def build_graph_for_task(
                 f"{metadata.gate_sequence_ids} no longer matches the recomputed sequence "
                 f"{recomputed_ids} for the same task text/profile/ignored gates -- has the "
                 "provider's routing changed since this task was planned?"
+            )
+        recomputed_catalog_digest = fingerprint(agent_catalog)
+        if (
+            metadata.agent_catalog_digest is not None
+            and recomputed_catalog_digest != metadata.agent_catalog_digest
+        ):
+            raise GraphConfigError(
+                f"task ID {task_id!r} graph-config.json is stale: the loaded agent catalog's "
+                f"content digest {recomputed_catalog_digest!r} no longer matches the digest "
+                f"{metadata.agent_catalog_digest!r} recorded at plan time -- has the agent "
+                "catalog (e.g. an agent's transport/endpoint) changed since this task was planned?"
             )
 
     resolved_model_client = model_client if model_client is not None else default_model_client(agent_catalog)

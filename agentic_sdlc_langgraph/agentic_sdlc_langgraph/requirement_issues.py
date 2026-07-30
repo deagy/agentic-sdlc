@@ -575,8 +575,51 @@ def _process_item_inner(
         issue = existing[0]
         _validate_matched_issue(issue, si, si.key)
         iid = issue.get("iid")
-        state = issue.get("state")
         uri = gitlab_issue.gitlab_issue_uri(project, iid)
+
+        # Author check on reuse, mirroring the create path's
+        # post-creation verification. The item label is deterministic
+        # and not secret (see `compute_marker`'s docstring -- hashing is
+        # to avoid leaking `task_id` externally, not to make the label
+        # unguessable), so without this check any Reporter+ contributor
+        # to the target project could pre-create an issue carrying
+        # `[FIXED_LABEL, item_label]` and have this tool silently adopt
+        # it as canonical -- worse than the accepted quick-action gap,
+        # since none of the creation-time controls (sanitization,
+        # post-creation verification) ever ran against that content at
+        # all. A follow-up authoritative fetch (not just the search
+        # response, whose exact field set isn't guaranteed here) is used
+        # so `author_username`/`state` are both read from the same
+        # verification shape the create path already trusts.
+        verification = gitlab_issue.fetch_gitlab_issue_verification(project, iid)
+        verified_author = (verification.get("author_username") or "").lower()
+        if verified_author != bot_username.lower():
+            entry = {
+                "item_key": si.key,
+                "marker": si.marker,
+                "status": "suspect",
+                "issue_uri": uri,
+                "issue_state": verification.get("state"),
+                "content_hash": si.content_hash,
+                "prior_title": si.raw_title,
+                "prior_description": si.raw_description,
+                "attempted_at": _now(),
+                "recorded_at": _now(),
+                "detail": (
+                    f"matched issue author {verification.get('author_username')!r} does not match "
+                    f"the verified bot identity {bot_username!r} -- refusing to reuse a "
+                    "possibly attacker-created issue"
+                ),
+            }
+            ledger["entries"][si.key] = entry
+            ledger["mocked"] = mocked
+            write_ledger(root, task_id, ledger)
+            raise RequirementIssuesBlocked(
+                f"item {si.key!r}: matched issue's author does not match the verified bot identity "
+                "-- refusing to reuse, needs human resolution"
+            )
+
+        state = verification.get("state")
 
         if prior_entry is None:
             drift = "reused (drift-unknown)"
@@ -721,7 +764,14 @@ def run(
     verification failure.
     """
     root = Path(root)
-    raw = read_items_source(items_source)
+    try:
+        raw = read_items_source(items_source)
+    except OSError as exc:
+        # A nonexistent/unreadable --items file (FileNotFoundError,
+        # PermissionError, IsADirectoryError, ...) must abort cleanly
+        # the same way a malformed-JSON --items file already does
+        # (`parse_items_file` below), not surface as a raw traceback.
+        raise RequirementIssuesError(f"unable to read --items {items_source!r}: {exc}") from exc
     items_file = parse_items_file(raw, max_items)
     gate_id = items_file.gate_id
 

@@ -255,6 +255,19 @@ def cmd_create_requirement_issues(args: argparse.Namespace) -> int:
     graph, config, metadata = built
     gate_id = "G2"
 
+    # Fail closed on operator misuse: a task whose derived gate sequence
+    # never included G2 at all (e.g. a route that skipped it) has no
+    # meaningful "publish for G2" operation -- without this check, a
+    # missing `lifecycle_gates["G2"]` entry would fall through to the
+    # same `gate_status: "pending"` default used for "in-sequence but not
+    # yet reached", silently treating an out-of-scope gate as eligible.
+    if gate_id not in metadata.gate_sequence_ids:
+        _error(
+            f"gate {gate_id!r} is not part of task {args.task_id!r}'s derived gate sequence "
+            f"{metadata.gate_sequence_ids} -- create-requirement-issues has nothing to publish for"
+        )
+        return 1
+
     def get_eligibility() -> requirement_issues.Eligibility:
         snapshot = graph.get_state(config)
         values = snapshot.values or {}

@@ -176,6 +176,22 @@ def test_sanitize_description_rejects_over_length():
         ri.sanitize_description("x" * 8001, "REQ-001")
 
 
+def test_sanitize_description_length_cap_enforced_after_neutralization():
+    """The 8000-char cap must be checked *after* mention/cross-ref
+    neutralization (step 5, which runs after step 4's neutralization,
+    per `sanitize_description`'s docstring) -- neutralization can only
+    grow the string (zero-width-space insertion), never shrink it, so a
+    description just under the raw cap but pushed over it by
+    neutralization must still be rejected."""
+    mentions = " @a" * 5  # each neutralized occurrence grows by 1 char (zwsp insertion)
+    filler = "x" * (7999 - len(mentions))
+    description = filler + mentions
+    assert len(description) == 7999  # under the cap *before* neutralization
+    assert len(ri._neutralize_references(description)) == 8004  # over the cap *after*
+    with pytest.raises(ri.RequirementIssuesError, match="exceeds 8000"):
+        ri.sanitize_description(description, "REQ-001")
+
+
 def test_sanitize_description_fences_backtick_runs_with_longer_fence():
     description = "here is a run of backticks: ```` inline"
     fence_len = ri._fence_length(description)

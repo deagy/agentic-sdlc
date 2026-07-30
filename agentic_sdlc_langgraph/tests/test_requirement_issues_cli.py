@@ -95,6 +95,22 @@ def _create_mock(**verify_overrides) -> dict:
     }
 
 
+def _reused_mock(*, iid=57, state="opened", labels=None, author_username=BOT) -> dict:
+    """A matched-issue mock for the reuse path: `search` returns the
+    minimal shape `search_gitlab_issues_by_labels` yields, and `verify`
+    supplies the authoritative `fetch_gitlab_issue_verification` response
+    the reuse path now fetches for every matched issue (author check --
+    see `_validate_matched_issue`'s neighbor, the reuse-path author
+    check in `_process_item_inner`)."""
+    search_labels = labels if labels is not None else ["agentic-sdlc", _LABEL]
+    return {
+        "identity": {"username": BOT},
+        "search": {_LABEL_KEY: [{"iid": iid, "state": state, "labels": search_labels}]},
+        "create": {},
+        "verify": {str(iid): _verify_payload(state=state, labels=search_labels, author={"username": author_username})},
+    }
+
+
 def _dry_run_digest(root: Path, task_id: str, items_path: Path, capsys, classification="internal") -> str:
     code, out, err = _run(
         [
@@ -167,13 +183,7 @@ def test_create_then_rerun_is_idempotent_zero_creates(tmp_path, capsys, monkeypa
     assert json.loads(out)["results"][0]["status"] == "created"
 
     # Second run: search now finds the created issue -- no create call.
-    reused_mock = {
-        "identity": {"username": BOT},
-        "search": {_LABEL_KEY: [{"iid": 57, "state": "opened", "labels": ["agentic-sdlc", _LABEL]}]},
-        "create": {},
-        "verify": {},
-    }
-    _write_mock(tmp_path, reused_mock, monkeypatch)
+    _write_mock(tmp_path, _reused_mock(), monkeypatch)
     digest2 = _dry_run_digest(tmp_path, "t1", items_path, capsys)
     code, out, err = _apply(tmp_path, "t1", items_path, digest2, capsys)
     assert code == 0, err
@@ -183,13 +193,7 @@ def test_create_then_rerun_is_idempotent_zero_creates(tmp_path, capsys, monkeypa
 def test_reuse_survives_deleted_ledger_forge_is_authoritative(tmp_path, capsys, monkeypatch):
     _plan(tmp_path, "t1", capsys)
     items_path = _write_items(tmp_path)
-    reused_mock = {
-        "identity": {"username": BOT},
-        "search": {_LABEL_KEY: [{"iid": 57, "state": "opened", "labels": ["agentic-sdlc", _LABEL]}]},
-        "create": {},
-        "verify": {},
-    }
-    _write_mock(tmp_path, reused_mock, monkeypatch)
+    _write_mock(tmp_path, _reused_mock(), monkeypatch)
     digest = _dry_run_digest(tmp_path, "t1", items_path, capsys)
     code, out, err = _apply(tmp_path, "t1", items_path, digest, capsys)
     assert code == 0, err
@@ -210,13 +214,7 @@ def test_reuse_survives_deleted_ledger_forge_is_authoritative(tmp_path, capsys, 
 def test_closed_matched_issue_is_reused_not_recreated(tmp_path, capsys, monkeypatch):
     _plan(tmp_path, "t1", capsys)
     items_path = _write_items(tmp_path)
-    mock = {
-        "identity": {"username": BOT},
-        "search": {_LABEL_KEY: [{"iid": 57, "state": "closed", "labels": ["agentic-sdlc", _LABEL]}]},
-        "create": {},
-        "verify": {},
-    }
-    _write_mock(tmp_path, mock, monkeypatch)
+    _write_mock(tmp_path, _reused_mock(state="closed"), monkeypatch)
     digest = _dry_run_digest(tmp_path, "t1", items_path, capsys)
     code, out, err = _apply(tmp_path, "t1", items_path, digest, capsys)
     assert code == 0, err
@@ -278,6 +276,27 @@ def test_matched_issue_with_foreign_item_label_aborts(tmp_path, capsys, monkeypa
     assert "foreign item label" in err
 
 
+def test_matched_issue_wrong_author_refuses_reuse(tmp_path, capsys, monkeypatch):
+    """The label pair `[FIXED_LABEL, item_label]` is deterministic and
+    not secret (see `compute_marker`'s docstring), so a matched issue
+    whose author is not the verified bot identity must never be silently
+    adopted -- it may be attacker/other-principal-created content that
+    never went through this tool's sanitization or creation-time
+    controls at all. Mirrors the create-path `author_username` mismatch
+    test (`test_post_creation_verification_failure_marks_suspect_and_aborts`),
+    but for the reuse path, which previously performed no author check."""
+    _plan(tmp_path, "t1", capsys)
+    items_path = _write_items(tmp_path)
+    _write_mock(tmp_path, _reused_mock(author_username="not-the-bot"), monkeypatch)
+    digest = _dry_run_digest(tmp_path, "t1", items_path, capsys)
+    code, _out, err = _apply(tmp_path, "t1", items_path, digest, capsys)
+    assert code == 2
+    assert "author" in err
+
+    ledger = requirement_issues.read_ledger(tmp_path, "t1")
+    assert ledger["entries"]["REQ-001"]["status"] == "suspect"
+
+
 def test_content_drift_reported_on_reuse_never_edits(tmp_path, capsys, monkeypatch):
     _plan(tmp_path, "t1", capsys)
     items_path = _write_items(tmp_path)
@@ -288,13 +307,7 @@ def test_content_drift_reported_on_reuse_never_edits(tmp_path, capsys, monkeypat
     changed_items = copy.deepcopy(ITEMS_ONE)
     changed_items["items"][0]["description"] = "A completely different description now."
     items_path2 = _write_items(tmp_path, changed_items, name="items2.json")
-    reused_mock = {
-        "identity": {"username": BOT},
-        "search": {_LABEL_KEY: [{"iid": 57, "state": "opened", "labels": ["agentic-sdlc", _LABEL]}]},
-        "create": {},
-        "verify": {},
-    }
-    _write_mock(tmp_path, reused_mock, monkeypatch)
+    _write_mock(tmp_path, _reused_mock(), monkeypatch)
     digest2 = _dry_run_digest(tmp_path, "t1", items_path2, capsys)
     code, out, err = _apply(tmp_path, "t1", items_path2, digest2, capsys)
     assert code == 0, err
@@ -426,6 +439,36 @@ def test_over_max_items_refuses_not_truncates(tmp_path, capsys, monkeypatch):
     )
     assert code == 1
     assert "max-items" in err
+
+
+def test_nonexistent_items_file_aborts_cleanly(tmp_path, capsys):
+    _plan(tmp_path, "t1", capsys)
+    code, _out, err = _run(
+        [
+            "create-requirement-issues", "--root", str(tmp_path), "--task-id", "t1",
+            "--project", "group/project", "--items", str(tmp_path / "does-not-exist.json"),
+            "--as-bot", BOT, "--allow-classification", "internal",
+        ],
+        capsys,
+    )
+    assert code == 1
+    assert "unable to read --items" in err
+
+
+def test_non_json_items_file_aborts_cleanly(tmp_path, capsys):
+    _plan(tmp_path, "t1", capsys)
+    bad_path = tmp_path / "not-json.txt"
+    bad_path.write_text("this is not json {{{", encoding="utf-8")
+    code, _out, err = _run(
+        [
+            "create-requirement-issues", "--root", str(tmp_path), "--task-id", "t1",
+            "--project", "group/project", "--items", str(bad_path),
+            "--as-bot", BOT, "--allow-classification", "internal",
+        ],
+        capsys,
+    )
+    assert code == 1
+    assert "not valid JSON" in err
 
 
 def test_bad_title_aborts_full_cli_path_with_zero_gitlab_calls(tmp_path, capsys, monkeypatch):
@@ -561,6 +604,30 @@ def test_run_halted_refuses(tmp_path, capsys, monkeypatch):
     assert "halted" in err
 
 
+def test_gate_not_in_derived_sequence_refuses(tmp_path, capsys, monkeypatch):
+    """A task whose derived gate sequence never included G2 at all (here,
+    forced via `--ignored-gates G2`) must be refused outright, not fall
+    through to the same `gate_status: "pending"` default used for
+    "in-sequence but not yet reached"."""
+    code, _out, err = _run(
+        ["plan", "--root", str(tmp_path), "--task-id", "t1", "--task", TASK_TEXT, "--ignored-gates", "G2"],
+        capsys,
+    )
+    assert code == 0, err
+    items_path = _write_items(tmp_path)
+    _write_mock(tmp_path, _create_mock(), monkeypatch)
+    code, _out, err = _run(
+        [
+            "create-requirement-issues", "--root", str(tmp_path), "--task-id", "t1",
+            "--project", "group/project", "--items", str(items_path), "--as-bot", BOT,
+            "--allow-classification", "internal",
+        ],
+        capsys,
+    )
+    assert code == 1
+    assert "not part of task" in err
+
+
 # --------------------------------------------------------------------------
 # Concurrency / durability
 # --------------------------------------------------------------------------
@@ -607,13 +674,7 @@ def test_issue_created_but_ledger_write_skipped_next_run_finds_via_search(tmp_pa
 
     # No ledger entry was ever written for this item, but the forge
     # already has the issue (as if create succeeded before a crash).
-    reused_mock = {
-        "identity": {"username": BOT},
-        "search": {_LABEL_KEY: [{"iid": 57, "state": "opened", "labels": ["agentic-sdlc", _LABEL]}]},
-        "create": {},
-        "verify": {},
-    }
-    _write_mock(tmp_path, reused_mock, monkeypatch)
+    _write_mock(tmp_path, _reused_mock(), monkeypatch)
     digest = _dry_run_digest(tmp_path, "t1", items_path, capsys)
     code, out, err = _apply(tmp_path, "t1", items_path, digest, capsys)
     assert code == 0, err

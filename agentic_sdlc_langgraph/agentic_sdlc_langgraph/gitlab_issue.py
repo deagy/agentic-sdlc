@@ -114,6 +114,20 @@ def _glab_launch_error(argv: list[str], verb: str, exc: BaseException) -> ValueE
     return ValueError(f"`{command}` {verb}: {exc.__class__.__name__} -- is glab installed and reachable?")
 
 
+def _parse_glab_json(raw_stdout: bytes, context: str):
+    """`json.loads(result.stdout)` for a `glab api` call that already
+    exited 0. A 0 exit code does not guarantee well-formed JSON on
+    stdout -- a warning banner mixed into stdout, a truncated write, or a
+    future `glab` version change could all produce non-JSON/partial
+    output. This must abort cleanly the same way a nonzero exit code
+    does, not raise an unhandled `json.JSONDecodeError`.
+    """
+    try:
+        return json.loads(raw_stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{context}: glab exited 0 but stdout was not valid JSON ({exc})") from exc
+
+
 def parse_gitlab_issue_uri(value: str) -> dict[str, str] | None:
     """Port of `agentic_sdlc.py`'s `parse_gitlab_issue_uri`."""
     match = GITLAB_ISSUE_URI.fullmatch(value)
@@ -137,17 +151,17 @@ def fetch_gitlab_issue(project_path: str, issue_iid: int) -> dict[str, Any]:
     if mock_path:
         raw_response = json.loads(Path(mock_path).read_text(encoding="utf-8"))
     else:
+        # Brought in line with this module's later-added hardened
+        # pattern (`_run_glab`): explicit timeout, private neutral cwd,
+        # and a clean abort on a nonzero exit code, launch failure
+        # (missing `glab` binary), timeout, or malformed JSON on stdout,
+        # rather than an unhandled traceback for any of those.
         encoded_project = quote(project_path, safe="")
-        result = subprocess.run(
-            ["glab", "api", f"projects/{encoded_project}/issues/{issue_iid}"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        result = _run_glab(["glab", "api", f"projects/{encoded_project}/issues/{issue_iid}"])
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "unknown glab api failure"
+            detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
             raise ValueError(f"unable to fetch GitLab issue for {project_path} issue {issue_iid}: {detail}")
-        raw_response = json.loads(result.stdout)
+        raw_response = _parse_glab_json(result.stdout, "fetch_gitlab_issue")
     if not isinstance(raw_response, dict):
         raise ValueError("GitLab issue API response must be a JSON object")
     title = raw_response.get("title")
@@ -219,7 +233,7 @@ def verify_gitlab_identity(expected_username: str) -> str:
         if result.returncode != 0:
             detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
             raise ValueError(f"unable to verify GitLab identity: {detail}")
-        raw = json.loads(result.stdout)
+        raw = _parse_glab_json(result.stdout, "verify_gitlab_identity")
         if not isinstance(raw, dict):
             raise ValueError("GitLab user API response must be a JSON object")
 
@@ -259,7 +273,7 @@ def search_gitlab_issues_by_labels(project_path: str, labels: list[str]) -> list
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
         raise ValueError(f"unable to search GitLab issues in {project_path} for labels {labels}: {detail}")
-    raw = json.loads(result.stdout)
+    raw = _parse_glab_json(result.stdout, "search_gitlab_issues_by_labels")
     if not isinstance(raw, list):
         raise ValueError("GitLab issue search response must be a JSON array")
     return raw
@@ -319,7 +333,7 @@ def create_gitlab_issue(project_path: str, title: str, description: str, labels:
         if result.returncode != 0:
             detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
             raise ValueError(f"unable to create GitLab issue in {project_path}: {detail}")
-        raw = json.loads(result.stdout)
+        raw = _parse_glab_json(result.stdout, "create_gitlab_issue")
         if not isinstance(raw, dict):
             raise ValueError("GitLab issue create response must be a JSON object")
 
@@ -361,7 +375,7 @@ def fetch_gitlab_issue_verification(project_path: str, iid: int) -> dict[str, An
             raise ValueError(
                 f"unable to fetch GitLab issue verification for {project_path} issue {iid}: {detail}"
             )
-        raw = json.loads(result.stdout)
+        raw = _parse_glab_json(result.stdout, "fetch_gitlab_issue_verification")
         if not isinstance(raw, dict):
             raise ValueError("GitLab issue verification response must be a JSON object")
 

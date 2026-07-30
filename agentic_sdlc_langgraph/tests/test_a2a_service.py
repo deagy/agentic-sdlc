@@ -130,6 +130,75 @@ def test_message_stream_emits_status_updates(client: TestClient, tmp_path):
     assert events[-1]["status"]["message"]["gate_id"] == "G1"
 
 
+def test_message_stream_reports_pending_interrupt_after_noop_update_state(client: TestClient, tmp_path, monkeypatch):
+    """K1 fix, exercised through the A2A `message/stream` SSE surface --
+    a separate code path from `tasks/get`'s `status_summary` (see
+    `a2a/server.py`'s `event_source`, which computed
+    `bool(snapshot.interrupts)` directly before this fix). Mirrors
+    `test_tasks_get_reports_pending_interrupt_after_invalidate` but drives
+    the fallback via a fake graph whose `.stream()` yields no updates and
+    whose `.get_state()` reports a snapshot with empty `interrupts` but a
+    `next` still pointing at `human_approval_G1` -- exactly the shape
+    `graph.update_state(...)` leaves behind (see `runtime.interrupt_status`).
+    """
+    from agentic_sdlc_langgraph.a2a import server
+
+    class _FakeSnapshot:
+        interrupts = ()
+        next = ("human_approval_G1",)
+        values = {}
+
+    class _FakeGraph:
+        def stream(self, *args, **kwargs):
+            return iter(())
+
+        def get_state(self, config):
+            return _FakeSnapshot()
+
+    def _fake_build_graph_for_task(root, task_id, **kwargs):
+        return _FakeGraph(), {"configurable": {"thread_id": task_id}}, None
+
+    monkeypatch.setattr(server.runtime, "build_graph_for_task", _fake_build_graph_for_task)
+
+    with client.stream(
+        "POST",
+        "/a2a",
+        json={
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/stream",
+            "params": _send_params(TASK_TEXT, task_id="a2a-stream-k1", root=str(tmp_path)),
+        },
+    ) as response:
+        assert response.status_code == 200
+        events = [json.loads(line[len("data: "):]) for line in response.iter_lines() if line.startswith("data: ")]
+
+    assert events[-1]["final"] is True
+    assert events[-1]["status"]["state"] == "input-required"
+    assert events[-1]["status"]["message"]["pending_interrupt_node"] == "human_approval_G1"
+    assert events[-1]["status"]["message"]["interrupt_payload_unavailable"] is True
+
+
+def test_tasks_get_reports_pending_interrupt_after_invalidate(client: TestClient, tmp_path):
+    """K1 fix, exercised through the A2A `tasks/get` surface."""
+    from agentic_sdlc_langgraph import runtime
+    from agentic_sdlc_langgraph.reentry import invalidate_gates
+
+    _rpc(client, "message/send", _send_params(TASK_TEXT, task_id="a2a-k1", root=str(tmp_path)))
+
+    graph, config, metadata = runtime.build_graph_for_task(tmp_path, "a2a-k1")
+    invalidate_gates(
+        graph, config, earliest_gate_id="G1", reason="test", actor="tester",
+        all_gate_ids=metadata.gate_sequence_ids,
+    )
+
+    response = _rpc(client, "tasks/get", {"id": "a2a-k1"})
+    result = response.json()["result"]
+    assert result["status"]["state"] == "input-required"
+    assert result["status"]["message"]["pending_interrupt_node"] == "human_approval_G1"
+    assert result["status"]["message"]["interrupt_payload_unavailable"] is True
+
+
 def test_unknown_method_returns_jsonrpc_error(client: TestClient):
     response = _rpc(client, "tasks/cancel", {"id": "nope"})
     assert response.status_code == 200

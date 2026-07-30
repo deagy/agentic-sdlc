@@ -320,6 +320,134 @@ def test_agent_catalog_digest_mismatch_raises_explicit_provider_path(tmp_path: P
         runtime.build_graph_for_task(tmp_path, "task-1", model_client=FakeModelClient(), checkpointer=checkpointer)
 
 
+
+# --------------------------------------------------------------------------
+# K1 fix: status_summary must not blind itself to a still-pending interrupt
+# after any `graph.update_state(...)` call empties `snapshot.interrupts`
+# (see reentry.py's `invalidate_gates`/`reenter_gate`, both of which call
+# `update_state`). See runtime.py's `status_summary` for the fallback.
+# --------------------------------------------------------------------------
+
+from agentic_sdlc_langgraph.reentry import invalidate_gates
+
+
+def test_status_summary_reports_interrupt_before_any_update_state(tmp_path: Path):
+    graph, config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=_memory_checkpointer()
+    )
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+
+    summary = runtime.status_summary(graph, config, metadata)
+    assert summary["interrupted"] is True
+    assert summary["interrupt"]["gate_id"] == "G1"
+    assert summary["interrupt_payload_unavailable"] is False
+    assert summary["pending_interrupt_node"] is None
+
+
+def test_status_summary_falls_back_after_noop_update_state(tmp_path: Path):
+    checkpointer = _memory_checkpointer()
+    graph, config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+
+    # A no-op update_state (no as_node) empties snapshot.interrupts while
+    # leaving the graph genuinely suspended at human_approval_G1.
+    graph.update_state(config, {})
+    snapshot = graph.get_state(config)
+    assert snapshot.interrupts == ()
+    assert snapshot.next == ("human_approval_G1",)
+
+    summary = runtime.status_summary(graph, config, metadata)
+    assert summary["interrupted"] is True
+    assert summary["interrupt"] is None  # never fabricate a payload we don't have
+    assert summary["interrupt_payload_unavailable"] is True
+    assert summary["pending_interrupt_node"] == "human_approval_G1"
+
+
+def test_status_summary_falls_back_after_noop_update_state_at_mutation_gate(tmp_path: Path):
+    """Same fallback, but for the other pending-node case the fallback
+    checks: `mutation_gate_check` itself, not a `human_approval_*` gate --
+    the graph's entry guard interrupts there when `scope` matches a
+    human-only mutation phrase, before any gate ever dispatches."""
+    mutation_task_text = TASK_TEXT + " -- this will delete data as part of the rollout"
+    checkpointer = _memory_checkpointer()
+    graph, config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-mut", task_text=mutation_task_text,
+        model_client=FakeModelClient(), checkpointer=checkpointer,
+    )
+    result = graph.invoke(runtime.initial_state("task-mut", mutation_task_text), config=config)
+    assert result["__interrupt__"][0].value["kind"] == "mutation_gate"
+
+    snapshot = graph.get_state(config)
+    assert snapshot.next == ("mutation_gate_check",)
+
+    graph.update_state(config, {})
+    snapshot = graph.get_state(config)
+    assert snapshot.interrupts == ()
+    assert snapshot.next == ("mutation_gate_check",)
+
+    summary = runtime.status_summary(graph, config, metadata)
+    assert summary["interrupted"] is True
+    assert summary["interrupt"] is None
+    assert summary["interrupt_payload_unavailable"] is True
+    assert summary["pending_interrupt_node"] == "mutation_gate_check"
+
+
+def test_status_summary_unaffected_for_non_suspended_task(tmp_path: Path):
+    """A freshly-built graph that has never been invoked has no pending
+    node in `snapshot.next` at all -- the fallback must not fire."""
+    graph, config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=_memory_checkpointer()
+    )
+    summary = runtime.status_summary(graph, config, metadata)
+    assert summary["interrupted"] is False
+    assert summary["interrupt"] is None
+    assert summary["interrupt_payload_unavailable"] is False
+    assert summary["pending_interrupt_node"] is None
+
+
+def test_status_summary_unaffected_for_completed_task(tmp_path: Path):
+    from langgraph.types import Command
+
+    checkpointer = _memory_checkpointer()
+    graph, config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    approval = {"status": "approved", "approver": {"id": "x", "role": "x", "kind": "human"}, "evidence_refs": []}
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+    for _ in range(3):
+        graph.invoke(Command(resume=approval), config=config)
+
+    summary = runtime.status_summary(graph, config, metadata)
+    assert summary["interrupted"] is False
+    assert summary["interrupt_payload_unavailable"] is False
+    assert summary["pending_interrupt_node"] is None
+
+
+def test_invalidate_gates_does_not_blind_status_to_still_pending_interrupt(tmp_path: Path):
+    """`invalidate_gates` (reentry.py) calls `graph.update_state(...)`
+    with no `as_node` -- the graph stays suspended at whatever node it
+    was already interrupted at. `status` must still report that pending
+    interrupt afterward, not silently clear it."""
+    checkpointer = _memory_checkpointer()
+    graph, config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+    assert graph.get_state(config).interrupts[0].value["gate_id"] == "G1"
+
+    invalidate_gates(
+        graph, config, earliest_gate_id="G1", reason="test", actor="tester",
+        all_gate_ids=metadata.gate_sequence_ids,
+    )
+
+    summary = runtime.status_summary(graph, config, metadata)
+    assert summary["interrupted"] is True
+    assert summary["interrupt_payload_unavailable"] is True
+    assert summary["pending_interrupt_node"] == "human_approval_G1"
+
+
 def test_missing_recorded_digest_skips_tripwire_for_pre_fix_graph_config(tmp_path: Path):
     """A `graph-config.json` written before this field existed
     (schema_version < 2, no `agent_catalog_digest` key) can't be

@@ -64,7 +64,57 @@ uv run agentic-sdlc-lg export   --root "$ROOT" --task-id demo-1 --output /tmp/ru
 uv run agentic-sdlc-lg validate --root "$ROOT" --task-id demo-1   # exits 0/1/2, see below
 uv run agentic-sdlc-lg invalidate --root "$ROOT" --task-id demo-1 --earliest-gate G2 --reason "..." --actor "..."
 uv run agentic-sdlc-lg reenter    --root "$ROOT" --task-id demo-1 --earliest-gate G2 --reason "..." --actor "..."
+
+# Stage A, GitLab-only: back a G2 Requirements Baseline item list with real
+# GitLab issues, idempotently (reused by label across re-entries, never
+# duplicated). See requirement_issues.py.
+uv run agentic-sdlc-lg create-requirement-issues --root "$ROOT" --task-id demo-1 \
+  --project group/project --items /path/to/items.json --as-bot svc-agentic-sdlc \
+  --allow-classification internal   # --dry-run (default): prints a plan digest only
+
+uv run agentic-sdlc-lg create-requirement-issues --root "$ROOT" --task-id demo-1 \
+  --project group/project --items /path/to/items.json --as-bot svc-agentic-sdlc \
+  --allow-classification internal --apply --plan-digest <digest from --dry-run>
+
+uv run agentic-sdlc-lg list-requirement-issues --root "$ROOT" --task-id demo-1
 ```
+
+`create-requirement-issues` requires a dedicated bot/machine GitLab
+identity (`--as-bot`): the command calls `glab api user` and refuses to
+proceed unless the *authenticated* identity matches `--as-bot` exactly
+(case-insensitively). The tool only verifies this -- it does not choose or
+switch credentials for you. Point your `glab` credential configuration
+(e.g. `GLAB_CONFIG_DIR`, or whatever your `glab` install uses to select a
+host/token) at the bot's credentials *before* running this command,
+especially before `--apply`.
+
+`--apply` holds a whole-run lock (`<root>/.agentic-sdlc/runs/<task_id>/
+requirement-issues.lock`, `O_CREAT|O_EXCL`) for the duration of the run.
+This lock is **local-filesystem-scoped only** -- it prevents two
+concurrent `--apply` runs on the *same host* sharing the same `root`, but
+does **not** prevent two different hosts/runners from concurrently
+applying against the same task against two independent local filesystems.
+Only one host/runner should be running `--apply` for a given task at a
+time; this is an operational convention this tool cannot enforce across
+hosts. If that convention is violated and a genuine race occurs, the
+result is *detected*, not *prevented*: the per-item label search (the
+actual idempotency mechanism -- see `requirement_issues.py`) will find
+`n > 1` matching issues on a later run and abort with the ambiguous-match
+error, requiring human resolution, rather than silently duplicating or
+corrupting anything.
+
+**Accepted residual risk (v1, human-input-only):** post-creation
+verification can only catch quick-action injection that corrupts a field
+it actually re-checks (labels, assignees, confidential, state, title,
+project, author). GitLab quick actions with no corresponding checkable
+field (`/relate`, `/spend`, `/subscribe`, `/due`, `/weight`, `/milestone`,
+`/epic`, ...) are not independently detectable by that verification step;
+the actual primary control is the description-line quick-action rejection
+in `sanitize_description`. This is accepted for v1 because Stage A only
+ever accepts human-supplied item content (no agent/LLM content path exists
+yet) -- see `requirement_issues.py`'s module docstring. This acceptance
+must be revisited before any future stage that lets agent-authored content
+reach `create_gitlab_issue` is authorized.
 
 Each command is a separate process — state persists across them in
 `<root>/.agentic-sdlc/state.db` (a LangGraph `SqliteSaver`) and
@@ -95,6 +145,8 @@ caller can drive a task end to end.
 | `reentry.py` | Invalidate/reenter as `graph.update_state(...)` operations, with real re-execution on reenter |
 | `export.py`, `validate.py` | Schema-shaped run-record export and the residual (0/1/2) validator |
 | `github_approval.py` | GitHub PR review → `Command(resume=...)` approval adapter |
+| `gitlab_issue.py` | GitLab issue linkage (G1/G2 source) plus the four GitLab calls `requirement_issues.py` uses |
+| `requirement_issues.py` | Stage A `create-requirement-issues`/`list-requirement-issues`: item validation, sanitization, plan-digest, sidecar ledger, orchestration -- backend-neutral, never imported by `graph.py` |
 | `runtime.py`, `cli.py`, `service.py` | Cross-process graph rebuild, CLI, and HTTP service |
 
 Every module's docstring documents which legacy `agentic_sdlc.py` function

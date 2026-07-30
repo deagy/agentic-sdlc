@@ -311,9 +311,18 @@ class OpenAICompatibleModelClient:
     def _client(self):  # -> openai.OpenAI
         import openai  # local import: keep this optional dependency lazy
 
+        base_url = self.base_url or os.environ.get("OPENAI_BASE_URL")
+        if base_url is not None:
+            # `base_url=None` is a legitimate "use the SDK's own default"
+            # signal (real api.openai.com over https), not an error -- the
+            # guard only applies once a base_url is actually configured.
+            from .a2a.client import require_https_or_local  # local import: shared host-scheme guard
+
+            require_https_or_local(base_url, label="OPENAI_BASE_URL")
+
         return openai.OpenAI(
             api_key=self.api_key or os.environ.get("OPENAI_API_KEY"),
-            base_url=self.base_url or os.environ.get("OPENAI_BASE_URL"),
+            base_url=base_url,
         )
 
     def complete(

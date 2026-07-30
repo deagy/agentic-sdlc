@@ -24,6 +24,17 @@ DEFAULT_TIMEOUT = 60.0
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+def require_https_or_local(url: str, *, label: str) -> None:
+    """Raise `ValueError` unless `url` uses https or points at a
+    recognized local-dev host (localhost/127.0.0.1/::1). Shared by
+    `A2AClient` and `agents.OpenAICompatibleModelClient` so a
+    misconfigured plain-http endpoint/base_url can't silently send
+    credentials or role-prompt/task content in cleartext."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" and parsed.hostname not in _LOCAL_HOSTS:
+        raise ValueError(f"{label} {url!r} must use https unless the host is a recognized local-dev host")
+
+
 class A2AClient:
     """Talks to one external A2A agent's JSON-RPC endpoint, discovered
     via its agent card. `transport` may be a real `httpx.Client` or an
@@ -37,11 +48,7 @@ class A2AClient:
         http_client: httpx.Client | None = None,
         timeout: float = DEFAULT_TIMEOUT,
     ):
-        parsed = urlsplit(base_url)
-        if parsed.scheme != "https" and parsed.hostname not in _LOCAL_HOSTS:
-            raise ValueError(
-                f"A2A endpoint {base_url!r} must use https unless the host is a recognized local-dev host"
-            )
+        require_https_or_local(base_url, label="A2A endpoint")
         # Auth headers/credentials for the A2A endpoint would go here --
         # tracked as a known, owned gap; not implemented in this change
         # (would require new agent-catalog schema surface).

@@ -20,6 +20,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from agentic_sdlc_langgraph.agents import (
@@ -393,6 +394,60 @@ def test_openai_compatible_model_client_explicit_fields_override_env(monkeypatch
 
     assert captured["api_key"] == "explicit-key"
     assert captured["base_url"] == "https://self-hosted.invalid/v1"
+
+
+def _install_fake_openai_module(monkeypatch):
+    class _FakeOpenAIModule:
+        @staticmethod
+        def OpenAI(*, api_key, base_url):
+            return _FakeOpenAIClient(None)
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", _FakeOpenAIModule())
+
+
+def test_openai_compatible_model_client_rejects_plain_http_base_url_for_non_local_host(monkeypatch):
+    """Mirrors `A2AClient`'s https-required-unless-local guard: a
+    misconfigured `OPENAI_BASE_URL` (e.g. a typo dropping the `s` in
+    `https`) must not silently send `OPENAI_API_KEY` and the role
+    prompt/task text in cleartext."""
+    _install_fake_openai_module(monkeypatch)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini", base_url="http://self-hosted.example.com/v1")
+
+    with pytest.raises(ValueError):
+        client._client()
+
+
+def test_openai_compatible_model_client_accepts_plain_http_base_url_for_localhost(monkeypatch):
+    _install_fake_openai_module(monkeypatch)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini", base_url="http://localhost:11434/v1")
+    client._client()  # must not raise
+
+
+def test_openai_compatible_model_client_accepts_plain_http_base_url_for_127_0_0_1(monkeypatch):
+    _install_fake_openai_module(monkeypatch)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini", base_url="http://127.0.0.1:11434/v1")
+    client._client()  # must not raise
+
+
+def test_openai_compatible_model_client_accepts_plain_http_base_url_for_ipv6_loopback(monkeypatch):
+    _install_fake_openai_module(monkeypatch)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini", base_url="http://[::1]:11434/v1")
+    client._client()  # must not raise
+
+
+def test_openai_compatible_model_client_accepts_https_base_url_for_any_host(monkeypatch):
+    _install_fake_openai_module(monkeypatch)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini", base_url="https://api.openai.com/v1")
+    client._client()  # must not raise
+
+
+def test_openai_compatible_model_client_accepts_no_base_url(monkeypatch):
+    """`base_url=None` (neither the field nor `OPENAI_BASE_URL` set) is a
+    legitimate 'use the SDK's own default' signal -- no guard applies."""
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    _install_fake_openai_module(monkeypatch)
+    client = OpenAICompatibleModelClient(model="gpt-4o-mini")
+    client._client()  # must not raise
 
 
 @dataclass

@@ -554,6 +554,27 @@ class V03MigrationTests(unittest.TestCase):
         self.assertFalse(any("lacks required reviewer role" in error for error in result["errors"]), result["errors"])
         self.assertFalse(any("is not a catalog reviewer" in error for error in result["errors"]), result["errors"])
 
+    def test_validate_accepts_service_verifier_without_consulting_the_agent_catalog(self):
+        # `service` is the third identity `kind` (run-record.schema.json's
+        # `identity` $def enum: human/agent/service) -- exercise it
+        # independently of the human-kind case above so all three enum
+        # values are pinned, not just two of three.
+        result = self._approved_g1_gate("REV-4", {"id": "ci-bot", "role": "CI Bot", "kind": "service"})
+        self.assertFalse(any("lacks required reviewer role" in error for error in result["errors"]), result["errors"])
+        self.assertFalse(any("is not a catalog reviewer" in error for error in result["errors"]), result["errors"])
+
+    def test_validate_rejects_non_string_agent_verifier_role_instead_of_crashing(self):
+        # A schema-invalid `role` (e.g. a list) is reported as a validation
+        # error, not an uncaught TypeError from `agent_catalog.get(role, {})`
+        # -- schema violations are appended to `errors` but do not stop this
+        # function's per-gate checks (see validator.iter_errors() above),
+        # so this line is reachable even for a hand-edited/malformed record.
+        result = self._approved_g1_gate("REV-5", {"id": "x", "role": ["oops"], "kind": "agent"})
+        self.assertTrue(
+            any("verifier role must be a string" in error for error in result["errors"]),
+            result["errors"],
+        )
+
     def test_parse_gitlab_issue_uri(self):
         parsed = agentic_sdlc.parse_gitlab_issue_uri("gitlab-issue:group/project:issues/42")
         self.assertEqual({"project_path": "group/project", "iid": "42"}, parsed)

@@ -1904,8 +1904,23 @@ def validate_repository(args: argparse.Namespace) -> int:
                     errors.append(f"{record_path}: {gate_id} approved with unresolved authority applicability")
                 if not isinstance(verifier, dict) or not gate.get("independence_declaration", {}).get("verifier_confirmed_not_preparer"):
                     errors.append(f"{record_path}: {gate_id} lacks an independent verifier declaration")
-                elif verifier.get("kind") == "agent" and agent_catalog.get(verifier.get("role"), {}).get("kind") != "reviewer":
-                    errors.append(f"{record_path}: {gate_id} verifier agent is not a catalog reviewer")
+                elif verifier.get("kind") == "agent":
+                    # `role` is expected to be the agent-catalog id (e.g.
+                    # "code-reviewer"), not a free-text label -- only
+                    # `kind: "agent"` verifiers are looked up this way.
+                    # `kind` here is the identity's own kind (human/agent/
+                    # service, run-record.schema.json's `identity` $def) --
+                    # a different axis from the agent catalog's per-role
+                    # kind (author/reviewer/specialist) checked below. Do
+                    # not drop this guard: a human/service verifier's
+                    # `role` is not a catalog id, and checking it against
+                    # the catalog unconditionally regressed to always
+                    # rejecting them (issue #9).
+                    verifier_role = verifier.get("role")
+                    if not isinstance(verifier_role, str):
+                        errors.append(f"{record_path}: {gate_id} verifier role must be a string")
+                    elif agent_catalog.get(verifier_role, {}).get("kind") != "reviewer":
+                        errors.append(f"{record_path}: {gate_id} verifier agent is not a catalog reviewer")
                 approvals = [approval for approval in gate.get("human_approvals", []) if approval.get("status") == "approved"]
                 approval_roles = {approval.get("approver", {}).get("role") for approval in approvals if isinstance(approval.get("approver"), dict)}
                 required_roles = {

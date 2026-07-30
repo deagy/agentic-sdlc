@@ -25,10 +25,17 @@ uv sync
 uv run pytest
 ```
 
-No `ANTHROPIC_API_KEY` is required to run the tests — they use a
-deterministic `FakeModelClient`. Set
+No `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is required to run the tests — they
+use a deterministic `FakeModelClient`. Set
 `AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL=1` to make the CLI/service use it too
-(no network calls), instead of the real `AnthropicModelClient`.
+(no network calls), instead of a real model-backed client. Otherwise,
+`AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` selects which real client:
+`anthropic` (default) uses `AnthropicModelClient`; `openai` uses
+`OpenAICompatibleModelClient` against any OpenAI-compatible
+chat-completions server (OpenAI itself, or a self-hosted/third-party
+server mirroring its API shape — vLLM, Ollama, Azure OpenAI, LiteLLM,
+etc, via `OPENAI_BASE_URL`), and requires
+`AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL` to name the model to call.
 
 ## CLI
 
@@ -83,7 +90,7 @@ caller can drive a task end to end.
 | `state.py` | Graph state schema (`SDLCState`/`GateState`), mirroring `run-record.schema.json` |
 | `contracts.py`, `planning.py` | Contract loaders and build-time gate-sequence derivation |
 | `provider.py` | Pure-function provider/profile loading (semver, path confinement, separation-of-duties at load time) |
-| `agents.py` | `ModelClient` protocol, `FakeModelClient`/`AnthropicModelClient`, role-prompt resolution |
+| `agents.py` | `ModelClient` protocol, `FakeModelClient`/`AnthropicModelClient`/`OpenAICompatibleModelClient`, role-prompt resolution |
 | `graph.py` | Declarative graph builder: dispatch, gate decisions, human/mutation-gate interrupts |
 | `reentry.py` | Invalidate/reenter as `graph.update_state(...)` operations, with real re-execution on reenter |
 | `export.py`, `validate.py` | Schema-shaped run-record export and the residual (0/1/2) validator |

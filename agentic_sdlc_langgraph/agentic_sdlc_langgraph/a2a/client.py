@@ -14,10 +14,25 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from .types import Message, Task, TextPart
+
+DEFAULT_TIMEOUT = 60.0
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def require_https_or_local(url: str, *, label: str) -> None:
+    """Raise `ValueError` unless `url` uses https or points at a
+    recognized local-dev host (localhost/127.0.0.1/::1). Shared by
+    `A2AClient` and `agents.OpenAICompatibleModelClient` so a
+    misconfigured plain-http endpoint/base_url can't silently send
+    credentials or role-prompt/task content in cleartext."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" and parsed.hostname not in _LOCAL_HOSTS:
+        raise ValueError(f"{label} {url!r} must use https unless the host is a recognized local-dev host")
 
 
 class A2AClient:
@@ -26,9 +41,19 @@ class A2AClient:
     `httpx.Client(transport=httpx.ASGITransport(app=...))` for talking to
     an in-process ASGI app in tests, without a real network port."""
 
-    def __init__(self, base_url: str, *, http_client: httpx.Client | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        http_client: httpx.Client | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+    ):
+        require_https_or_local(base_url, label="A2A endpoint")
+        # Auth headers/credentials for the A2A endpoint would go here --
+        # tracked as a known, owned gap; not implemented in this change
+        # (would require new agent-catalog schema surface).
         self._base_url = base_url.rstrip("/")
-        self._http = http_client or httpx.Client(base_url=self._base_url)
+        self._http = http_client or httpx.Client(base_url=self._base_url, timeout=timeout)
         self._rpc_url: str | None = None
 
     def _endpoint(self) -> str:
@@ -36,7 +61,14 @@ class A2AClient:
             response = self._http.get("/.well-known/agent.json")
             response.raise_for_status()
             card = response.json()
-            self._rpc_url = card["url"]
+            rpc_url = card["url"]
+            base = urlsplit(self._base_url)
+            rpc = urlsplit(rpc_url)
+            if (base.scheme, base.hostname, base.port) != (rpc.scheme, rpc.hostname, rpc.port):
+                raise ValueError(
+                    f"agent card url {rpc_url!r} origin does not match configured endpoint {self._base_url!r}"
+                )
+            self._rpc_url = rpc_url
         return self._rpc_url
 
     def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:

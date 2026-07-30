@@ -22,9 +22,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from agentic_sdlc_langgraph import runtime
-from agentic_sdlc_langgraph.agents import AnthropicModelClient, FakeModelClient
+from agentic_sdlc_langgraph.agents import AnthropicModelClient, FakeModelClient, OpenAICompatibleModelClient
 
 TASK_TEXT = "Define and review a small internal order-processing API architecture and service"
+PROVIDER_DEFAULTS = runtime.KERNEL_ROOT / "providers" / "agentic-sdlc-defaults"
 
 
 def _memory_checkpointer() -> SqliteSaver:
@@ -53,15 +54,17 @@ def test_first_call_writes_graph_config_json(tmp_path: Path):
     assert config_path.is_file()
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     assert payload == {
-        "schema_version": 1,
+        "schema_version": runtime.GRAPH_CONFIG_SCHEMA_VERSION,
         "task_id": "task-1",
         "task_text": TASK_TEXT,
         "profile_id": "generic",
         "provider_manifest": None,
         "ignored_gate_ids": [],
         "gate_sequence_ids": ["G1", "G2", "G3"],
+        "agent_catalog_digest": payload["agent_catalog_digest"],
         "created_at": payload["created_at"],
     }
+    assert payload["agent_catalog_digest"].startswith("sha256:")
 
     # The graph itself is genuinely usable: it interrupts at G1.
     result = graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
@@ -157,7 +160,44 @@ def test_default_model_client_is_fake_when_env_var_set(monkeypatch: pytest.Monke
 
 def test_default_model_client_is_anthropic_when_env_var_unset(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.delenv(runtime.MODEL_PROVIDER_ENV_VAR, raising=False)
     assert isinstance(runtime.default_model_client(), AnthropicModelClient)
+
+
+def test_default_model_client_is_anthropic_when_provider_explicit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "anthropic")
+    assert isinstance(runtime.default_model_client(), AnthropicModelClient)
+
+
+def test_default_model_client_is_openai_when_provider_set(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
+    monkeypatch.setenv(runtime.OPENAI_MODEL_ENV_VAR, "gpt-4o-mini")
+    client = runtime.default_model_client()
+    assert isinstance(client, OpenAICompatibleModelClient)
+    assert client.model == "gpt-4o-mini"
+
+
+def test_default_model_client_openai_requires_model_env_var(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
+    monkeypatch.delenv(runtime.OPENAI_MODEL_ENV_VAR, raising=False)
+    with pytest.raises(runtime.GraphConfigError):
+        runtime.default_model_client()
+
+
+def test_default_model_client_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "bogus")
+    with pytest.raises(runtime.GraphConfigError):
+        runtime.default_model_client()
+
+
+def test_fake_model_env_var_takes_precedence_over_provider(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(runtime.FAKE_MODEL_ENV_VAR, "1")
+    monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
+    assert isinstance(runtime.default_model_client(), FakeModelClient)
 
 
 def test_ignored_gates_are_recorded_and_excluded(tmp_path: Path):
@@ -174,3 +214,128 @@ def test_ignored_gates_are_recorded_and_excluded(tmp_path: Path):
     )
     assert metadata.gate_sequence_ids == ["G1", "G3"]
     assert metadata.ignored_gate_ids == ["G2"]
+
+
+# --------------------------------------------------------------------------
+# agent_catalog_digest staleness tripwire (Fix 3): a catalog edited between
+# `plan` and a later rebuild must be detected, for both the default
+# no-`--provider` path (`contracts.load_agent_catalog`) and the explicit
+# `--provider` path (`provider.load_provider`).
+# --------------------------------------------------------------------------
+
+
+def test_agent_catalog_digest_recorded_at_plan_time_default_path(tmp_path: Path):
+    _graph, _config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=_memory_checkpointer()
+    )
+    assert metadata.agent_catalog_digest is not None
+    assert metadata.agent_catalog_digest.startswith("sha256:")
+
+
+def test_agent_catalog_digest_stable_across_resume_default_path(tmp_path: Path):
+    checkpointer = _memory_checkpointer()
+    _graph, _config, metadata1 = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    # Second call for the same task_id, same (unmutated) default catalog --
+    # must succeed and report the identical digest, never raise.
+    _graph2, _config2, metadata2 = runtime.build_graph_for_task(
+        tmp_path, "task-1", model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    assert metadata2.agent_catalog_digest == metadata1.agent_catalog_digest
+
+
+def test_agent_catalog_digest_mismatch_raises_default_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Default (no-`--provider`) path: `contracts.load_agent_catalog`
+    computes no digest of its own, so this exercises the fallback that
+    fingerprints its return value directly."""
+    import shutil
+
+    provider_copy = tmp_path / "provider-copy"
+    shutil.copytree(runtime.DEFAULT_PROVIDER_ROOT, provider_copy)
+    monkeypatch.setattr(runtime, "DEFAULT_PROVIDER_ROOT", provider_copy)
+
+    checkpointer = _memory_checkpointer()
+    runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+
+    catalog_path = provider_copy / "agent-catalog.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["agents"]["code-reviewer"]["transport"] = "a2a"
+    catalog["agents"]["code-reviewer"]["endpoint"] = "https://attacker.example.com"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(runtime.GraphConfigError, match="agent catalog"):
+        runtime.build_graph_for_task(tmp_path, "task-1", model_client=FakeModelClient(), checkpointer=checkpointer)
+
+
+def test_agent_catalog_digest_stable_across_resume_explicit_provider(tmp_path: Path):
+    provider_manifest = PROVIDER_DEFAULTS / "provider.json"
+    checkpointer = _memory_checkpointer()
+    _graph, _config, metadata1 = runtime.build_graph_for_task(
+        tmp_path,
+        "task-1",
+        task_text=TASK_TEXT,
+        provider_manifest=str(provider_manifest),
+        model_client=FakeModelClient(),
+        checkpointer=checkpointer,
+    )
+    _graph2, _config2, metadata2 = runtime.build_graph_for_task(
+        tmp_path, "task-1", model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    assert metadata2.agent_catalog_digest == metadata1.agent_catalog_digest
+    assert metadata1.agent_catalog_digest is not None
+
+
+def test_agent_catalog_digest_mismatch_raises_explicit_provider_path(tmp_path: Path):
+    """Explicit `--provider` path: `provider.load_provider` already
+    computes `catalog_sha256`/`manifest_sha256`, but this fix uses a
+    fresh `fingerprint(agent_catalog)` computed uniformly for both paths
+    (see `runtime.build_graph_for_task`) -- a mutated catalog must still
+    be caught here."""
+    import shutil
+
+    provider_copy = tmp_path / "provider-copy"
+    shutil.copytree(PROVIDER_DEFAULTS, provider_copy)
+    provider_manifest = provider_copy / "provider.json"
+
+    checkpointer = _memory_checkpointer()
+    runtime.build_graph_for_task(
+        tmp_path,
+        "task-1",
+        task_text=TASK_TEXT,
+        provider_manifest=str(provider_manifest),
+        model_client=FakeModelClient(),
+        checkpointer=checkpointer,
+    )
+
+    catalog_path = provider_copy / "agent-catalog.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["agents"]["code-reviewer"]["transport"] = "a2a"
+    catalog["agents"]["code-reviewer"]["endpoint"] = "https://attacker.example.com"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(runtime.GraphConfigError, match="agent catalog"):
+        runtime.build_graph_for_task(tmp_path, "task-1", model_client=FakeModelClient(), checkpointer=checkpointer)
+
+
+def test_missing_recorded_digest_skips_tripwire_for_pre_fix_graph_config(tmp_path: Path):
+    """A `graph-config.json` written before this field existed
+    (schema_version < 2, no `agent_catalog_digest` key) can't be
+    retroactively verified -- the tripwire must be skipped, not raised,
+    for backward compatibility with already-planned tasks."""
+    _graph, _config, metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=_memory_checkpointer()
+    )
+    config_path = tmp_path / ".agentic-sdlc" / "runs" / "task-1" / "graph-config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    del payload["agent_catalog_digest"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # Must not raise despite no recorded digest to compare against.
+    _graph2, _config2, metadata2 = runtime.build_graph_for_task(
+        tmp_path, "task-1", model_client=FakeModelClient(), checkpointer=_memory_checkpointer()
+    )
+    assert metadata2.agent_catalog_digest is None

@@ -51,7 +51,7 @@ from agentic_sdlc_langgraph.provider import (
     merge_profile,
 )
 
-REPO_ROOT = Path("/home/deagy/sdk/agentic-sdlc")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS = REPO_ROOT / "plugins" / "agentic-sdlc" / "contracts"
 PROVIDER_DEFAULTS = REPO_ROOT / "providers" / "agentic-sdlc-defaults"
 DEFAULT_MANIFEST = PROVIDER_DEFAULTS / "provider.json"

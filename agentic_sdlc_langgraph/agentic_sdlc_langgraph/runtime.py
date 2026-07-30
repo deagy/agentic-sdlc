@@ -73,11 +73,22 @@ to reconstruct the graph shape, nothing about live gate status.
 - **Model client** (`AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL` environment
   variable): if set to `"1"`, `default_model_client()` returns a
   `FakeModelClient` (deterministic, zero network calls) instead of a real
-  `AnthropicModelClient`. **This is a real behavioral switch, not just a
+  model-backed client. **This is a real behavioral switch, not just a
   test convenience** -- set it in any environment (local dry runs, CI,
-  demos) that doesn't have `ANTHROPIC_API_KEY` configured, or that wants
+  demos) that doesn't have a model API key configured, or that wants
   reproducible agent output. It is unset (or any value other than `"1"`)
-  in a real deployment, where a live Anthropic-backed run is intended.
+  in a real deployment, where a live model-backed run is intended.
+
+- **Model provider** (`AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` environment
+  variable, checked only when the fake-model switch above is not active):
+  `"anthropic"` (the default, preserving prior behavior) selects
+  `AnthropicModelClient`; `"openai"` selects `OpenAICompatibleModelClient`,
+  reading its required `model` from `AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL`
+  (`OpenAICompatibleModelClient` itself reads `OPENAI_API_KEY`/
+  `OPENAI_BASE_URL`, so those aren't duplicated here) -- this is what lets
+  the engine target any OpenAI-compatible chat-completions server (OpenAI
+  itself, or a self-hosted/third-party server mirroring its API shape)
+  instead of Anthropic.
 """
 
 from __future__ import annotations
@@ -93,7 +104,13 @@ from typing import Any
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from .agents import AnthropicModelClient, DispatchingModelClient, FakeModelClient, ModelClient
+from .agents import (
+    AnthropicModelClient,
+    DispatchingModelClient,
+    FakeModelClient,
+    ModelClient,
+    OpenAICompatibleModelClient,
+)
 from .contracts import (
     load_agent_catalog,
     load_lifecycle_gates,
@@ -103,7 +120,7 @@ from .contracts import (
 from .export import _PHASE_BY_GATE_ID
 from .graph import build_graph
 from .planning import derive_gate_sequence
-from .provider import LoadedProvider, load_provider, merge_profile
+from .provider import LoadedProvider, fingerprint, load_provider, merge_profile
 
 # Root of *this* kernel checkout (contains `plugins/` and `providers/`) --
 # NOT the project root a CLI/service caller operates against (that's the
@@ -115,11 +132,17 @@ KERNEL_ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_DIR = KERNEL_ROOT / "plugins" / "agentic-sdlc" / "contracts"
 DEFAULT_PROVIDER_ROOT = KERNEL_ROOT / "providers" / "agentic-sdlc-defaults"
 
-GRAPH_CONFIG_SCHEMA_VERSION = 1
+GRAPH_CONFIG_SCHEMA_VERSION = 2
 
 # See module docstring: set to "1" to force FakeModelClient everywhere
 # `default_model_client()` is consulted (no network, fully deterministic).
 FAKE_MODEL_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL"
+
+# See module docstring: selects which real model-backed client
+# `default_model_client()` builds when the fake-model switch above isn't
+# active. Defaults to "anthropic" so existing deployments are unaffected.
+MODEL_PROVIDER_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER"
+OPENAI_MODEL_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL"
 
 
 class GraphConfigError(ValueError):
@@ -159,7 +182,9 @@ def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelCl
 
     Returns a `FakeModelClient` (deterministic, no network) when the
     `AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL` environment variable is set to
-    `"1"`; otherwise a real `AnthropicModelClient`. See module docstring.
+    `"1"`; otherwise a real model-backed client chosen by
+    `AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` (`"anthropic"`, the default, or
+    `"openai"`). See module docstring.
 
     If `agent_catalog` has any entry with `transport: "a2a"`, the
     resolved client is wrapped in a `DispatchingModelClient` so those
@@ -170,7 +195,20 @@ def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelCl
     if os.environ.get(FAKE_MODEL_ENV_VAR) == "1":
         base: ModelClient = FakeModelClient()
     else:
-        base = AnthropicModelClient()
+        provider = os.environ.get(MODEL_PROVIDER_ENV_VAR, "anthropic")
+        if provider == "openai":
+            openai_model = os.environ.get(OPENAI_MODEL_ENV_VAR)
+            if not openai_model:
+                raise GraphConfigError(
+                    f"{OPENAI_MODEL_ENV_VAR} must be set when {MODEL_PROVIDER_ENV_VAR}=openai"
+                )
+            base = OpenAICompatibleModelClient(model=openai_model)
+        elif provider == "anthropic":
+            base = AnthropicModelClient()
+        else:
+            raise GraphConfigError(
+                f"unknown {MODEL_PROVIDER_ENV_VAR}: {provider!r} (expected 'anthropic' or 'openai')"
+            )
     if agent_catalog and any(entry.get("transport") == "a2a" for entry in agent_catalog.values()):
         return DispatchingModelClient(default=base, agent_catalog=agent_catalog)
     return base
@@ -206,6 +244,16 @@ class TaskGraphMetadata:
     ignored_gate_ids: list[str]
     gate_sequence_ids: list[str]
     created_at: str
+    # sha256 fingerprint (`provider.fingerprint`) of the agent catalog
+    # loaded at plan time, either via `load_provider` (explicit
+    # `--provider`) or `contracts.load_agent_catalog` (the default
+    # no-provider path) -- recomputed and compared at every later rebuild
+    # as a staleness tripwire (see `_load_contracts_and_profile`'s
+    # caller in `build_graph_for_task`). `None` only for a
+    # `graph-config.json` written before this field existed
+    # (schema_version < 2); such a config can't be retroactively
+    # verified, so the tripwire is skipped rather than raising.
+    agent_catalog_digest: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -217,6 +265,7 @@ class TaskGraphMetadata:
             "ignored_gate_ids": list(self.ignored_gate_ids),
             "gate_sequence_ids": list(self.gate_sequence_ids),
             "created_at": self.created_at,
+            "agent_catalog_digest": self.agent_catalog_digest,
         }
 
     @classmethod
@@ -229,6 +278,7 @@ class TaskGraphMetadata:
             ignored_gate_ids=list(payload.get("ignored_gate_ids", [])),
             gate_sequence_ids=list(payload.get("gate_sequence_ids", [])),
             created_at=payload.get("created_at", ""),
+            agent_catalog_digest=payload.get("agent_catalog_digest"),
         )
 
 
@@ -338,6 +388,7 @@ def build_graph_for_task(
             ignored_gate_ids=ignored_gate_ids,
             gate_sequence_ids=[g["id"] for g in sequence],
             created_at=_now(),
+            agent_catalog_digest=fingerprint(agent_catalog),
         )
         _write_graph_config(root, metadata)
     else:
@@ -359,6 +410,17 @@ def build_graph_for_task(
                 f"{metadata.gate_sequence_ids} no longer matches the recomputed sequence "
                 f"{recomputed_ids} for the same task text/profile/ignored gates -- has the "
                 "provider's routing changed since this task was planned?"
+            )
+        recomputed_catalog_digest = fingerprint(agent_catalog)
+        if (
+            metadata.agent_catalog_digest is not None
+            and recomputed_catalog_digest != metadata.agent_catalog_digest
+        ):
+            raise GraphConfigError(
+                f"task ID {task_id!r} graph-config.json is stale: the loaded agent catalog's "
+                f"content digest {recomputed_catalog_digest!r} no longer matches the digest "
+                f"{metadata.agent_catalog_digest!r} recorded at plan time -- has the agent "
+                "catalog (e.g. an agent's transport/endpoint) changed since this task was planned?"
             )
 
     resolved_model_client = model_client if model_client is not None else default_model_client(agent_catalog)

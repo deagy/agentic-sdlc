@@ -468,6 +468,43 @@ def test_resume_approved_without_evidence_does_not_approve_gate(tmp_path: Path):
     assert gate["human_approvals"][-1]["status"] == "rejected"
 
 
+def test_resume_approved_by_a_preparer_does_not_approve_gate(tmp_path: Path):
+    """A resumed decision with well-formed evidence but whose `approver.id`
+    is one of the gate's own preparers must not be accepted as approval --
+    the engine now checks this synchronously (matching the kernel's `decide`
+    command's gate.preparers/independent_verifier refusal), not only via the
+    separate, later validate.py pass."""
+    from langgraph.types import Command
+
+    checkpointer = _memory_checkpointer()
+    graph, config, _metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+
+    snapshot = graph.get_state(config)
+    preparer_ids = [p["id"] for p in snapshot.values["lifecycle_gates"]["G1"]["preparers"]]
+    assert preparer_ids, "G1 must have a real preparer for this test to be meaningful"
+
+    approval = {
+        "status": "approved",
+        "approver": {"id": preparer_ids[0], "role": "x", "kind": "human"},
+        "evidence_refs": [{
+            "evidence_id": "test-evidence",
+            "uri": "test-evidence:manual",
+            "hash_algorithm": "sha256",
+            "hash": "0" * 64,
+            "classification": "internal",
+        }],
+    }
+    graph.invoke(Command(resume=approval), config=config)
+
+    snapshot = graph.get_state(config)
+    gate = snapshot.values["lifecycle_gates"]["G1"]
+    assert gate["status"] == "request-changes"
+    assert gate["human_approvals"][-1]["status"] == "rejected"
+
+
 def test_invalidate_gates_does_not_blind_status_to_still_pending_interrupt(tmp_path: Path):
     """`invalidate_gates` (reentry.py) calls `graph.update_state(...)`
     with no `as_node` -- the graph stays suspended at whatever node it

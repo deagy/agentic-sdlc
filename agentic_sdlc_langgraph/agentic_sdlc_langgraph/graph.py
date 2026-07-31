@@ -397,6 +397,11 @@ def build_graph(
                 # on the gate itself, not on the approval record.
                 decision_is_dict = isinstance(decision, dict)
                 evidence_refs = decision.get("evidence_refs", []) if decision_is_dict else []
+                approver = decision.get("approver") if decision_is_dict else None
+                approver_id = approver.get("id") if isinstance(approver, dict) else None
+                preparer_ids = {p.get("id") for p in current.get("preparers", []) if isinstance(p, dict)}
+                verifier = current.get("independent_verifier")
+                verifier_id = verifier.get("id") if isinstance(verifier, dict) else None
                 if violation:
                     approval_status = "rejected"
                     gate_status = "blocked"
@@ -408,6 +413,14 @@ def build_graph(
                         # CLAUDE.md's evidence invariant, enforced synchronously
                         # here the same way the kernel's `decide` command
                         # enforces it at write time).
+                        raw_status = "rejected"
+                    if raw_status == "approved" and approver_id and (approver_id in preparer_ids or approver_id == verifier_id):
+                        # Fail-closed: the resumed approver is one of this
+                        # gate's own preparers or its independent verifier --
+                        # the same self-approval refusal the kernel's `decide`
+                        # command enforces synchronously against
+                        # gate.preparers/independent_verifier, not left to a
+                        # later, separate validate.py pass.
                         raw_status = "rejected"
                     if raw_status in ("approved", "rejected", "pending", "not-required"):
                         approval_status = raw_status

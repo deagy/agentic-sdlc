@@ -631,6 +631,95 @@ class V03MigrationTests(unittest.TestCase):
         self.assertEqual("pending", gate["status"])
         self.assertEqual("rejected", gate["human_approvals"][0]["status"])
 
+    def test_decide_preserves_prior_rejection_when_later_approved(self):
+        # Regression: the dedup filter used to drop *any* prior entry by the
+        # same actor+role regardless of status, silently discarding a prior
+        # rejection's own evidence/rationale. It must now only replace a
+        # prior *approved* entry, matching record_github_approval/
+        # record_gitlab_approval's existing semantics.
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-8", "--task", "Create the service architecture", provider=True)
+        self.run_cli(
+            "decide",
+            "--task-id", "DEC-8",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "rejected",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:first-pass-rejection",
+            "--note", "needs more detail",
+        )
+        self.run_cli(
+            "decide",
+            "--task-id", "DEC-8",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:second-pass-approval",
+        )
+        record = self.load(".agentic-sdlc/runs/DEC-8/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        statuses = [approval["status"] for approval in gate["human_approvals"]]
+        self.assertEqual(["rejected", "approved"], statuses)
+        self.assertEqual("doc:first-pass-rejection", gate["human_approvals"][0]["evidence_refs"][0]["uri"])
+
+    def test_decide_rejects_unknown_decision_value(self):
+        # argparse's --decision choices already block this at the CLI layer;
+        # this exercises record_gate_decision directly since it is also a
+        # public library function other callers could invoke with an
+        # unvalidated string.
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-9", "--task", "Create the service architecture", provider=True)
+        with self.assertRaisesRegex(ValueError, "unknown decision"):
+            agentic_sdlc.record_gate_decision(
+                self.root, "DEC-9", "G1", "product_owner", "aproved", "alice", "doc:decision-record-9", None, None,
+            )
+
+    def test_decide_refuses_manual_evidence_when_policy_requires_github_review(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        project_path = self.root / ".agentic-sdlc" / "project.json"
+        project = self.load(".agentic-sdlc/project.json")
+        project["approval_sources"] = {"human_gate_default": "github-review", "allow_manual_fallback": False}
+        project_path.write_text(json.dumps(project), encoding="utf-8")
+        self.run_cli("plan", "--task-id", "DEC-10", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-10",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:i-said-so",
+            expected=1,
+        )
+        self.assertIn("must be backed by a GitHub review", result["error"])
+        record = self.load(".agentic-sdlc/runs/DEC-10/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual([], gate["human_approvals"])
+
+    def test_decide_accepts_manual_evidence_when_policy_allows_fallback(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        project_path = self.root / ".agentic-sdlc" / "project.json"
+        project = self.load(".agentic-sdlc/project.json")
+        project["approval_sources"] = {"human_gate_default": "github-review", "allow_manual_fallback": True}
+        project_path.write_text(json.dumps(project), encoding="utf-8")
+        self.run_cli("plan", "--task-id", "DEC-11", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-11",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:manual-fallback-ok",
+        )
+        self.assertEqual("approved", result["decision"])
+
     def _approved_g1_gate(self, task_id, verifier):
         # Shared setup for the three regression tests below (issue #9):
         # a gate that has already cleared every *other* approved-gate

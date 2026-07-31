@@ -122,7 +122,13 @@ def test_g1_g3_interrupt_resume_and_export(contracts):
     approval = {
         "status": "approved",
         "approver": {"id": "product_owner", "role": "Product Owner", "kind": "human"},
-        "evidence_refs": [],
+        "evidence_refs": [{
+            "evidence_id": "test-evidence",
+            "uri": "test-evidence:manual",
+            "hash_algorithm": "sha256",
+            "hash": "0" * 64,
+            "classification": "internal",
+        }],
     }
     result = graph.invoke(Command(resume=approval), config=config)
     assert "__interrupt__" in result
@@ -407,7 +413,13 @@ def test_full_g1_g10_happy_path_interrupts_in_order_and_exports_clean(contracts)
     approval = {
         "status": "approved",
         "approver": {"id": "approver", "role": "Approver", "kind": "human"},
-        "evidence_refs": [],
+        "evidence_refs": [{
+            "evidence_id": "test-evidence",
+            "uri": "test-evidence:manual",
+            "hash_algorithm": "sha256",
+            "hash": "0" * 64,
+            "classification": "internal",
+        }],
     }
 
     expected_gate_order = [f"G{n}" for n in range(1, 11)]

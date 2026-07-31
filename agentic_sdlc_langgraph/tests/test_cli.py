@@ -36,7 +36,13 @@ TASK_TEXT = "Define and review a small internal order-processing API architectur
 APPROVAL = {
     "status": "approved",
     "approver": {"id": "product_owner", "role": "Product Owner", "kind": "human"},
-    "evidence_refs": [],
+    "evidence_refs": [{
+        "evidence_id": "test-evidence",
+        "uri": "test-evidence:manual",
+        "hash_algorithm": "sha256",
+        "hash": "0" * 64,
+        "classification": "internal",
+    }],
 }
 
 

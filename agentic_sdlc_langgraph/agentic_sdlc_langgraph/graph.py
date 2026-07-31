@@ -362,6 +362,16 @@ def build_graph(
 
         if has_authority_requirements:
 
+            def _has_valid_evidence(evidence_refs: Any) -> bool:
+                if not isinstance(evidence_refs, list) or not evidence_refs:
+                    return False
+                required_fields = ("evidence_id", "uri", "hash_algorithm", "hash", "classification")
+                return all(
+                    isinstance(item, dict)
+                    and all(isinstance(item.get(field), str) and item[field] for field in required_fields)
+                    for item in evidence_refs
+                )
+
             def human_approval(state: SDLCState, gate_id=gate_id) -> dict[str, Any]:
                 current = state["lifecycle_gates"][gate_id]
                 violation = current["status"] == "blocked"
@@ -386,11 +396,19 @@ def build_graph(
                 # "approved"), while the richer "blocked" outcome is recorded
                 # on the gate itself, not on the approval record.
                 decision_is_dict = isinstance(decision, dict)
+                evidence_refs = decision.get("evidence_refs", []) if decision_is_dict else []
                 if violation:
                     approval_status = "rejected"
                     gate_status = "blocked"
                 else:
                     raw_status = decision.get("status", "pending") if decision_is_dict else "pending"
+                    if raw_status == "approved" and not _has_valid_evidence(evidence_refs):
+                        # Fail-closed: an "approved" claim with no well-formed
+                        # external evidence is not accepted as approval (see
+                        # CLAUDE.md's evidence invariant, enforced synchronously
+                        # here the same way the kernel's `decide` command
+                        # enforces it at write time).
+                        raw_status = "rejected"
                     if raw_status in ("approved", "rejected", "pending", "not-required"):
                         approval_status = raw_status
                     else:
@@ -402,7 +420,7 @@ def build_graph(
                     "status": approval_status,
                     "approver": decision.get("approver") if decision_is_dict else None,
                     "decided_at": _now(),
-                    "evidence_refs": decision.get("evidence_refs", []) if decision_is_dict else [],
+                    "evidence_refs": evidence_refs,
                 }
                 new_gate["human_approvals"] = current.get("human_approvals", []) + [approval]
                 new_gate["decided_at"] = approval["decided_at"]

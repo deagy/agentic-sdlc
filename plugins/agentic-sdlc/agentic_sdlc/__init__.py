@@ -607,6 +607,54 @@ def can_mark_gate_approved(record: dict[str, Any], gate: dict[str, Any], authori
     return has_all_required_human_approvals(gate, authorities)
 
 
+def _resolve_gate_authority(
+    record: dict[str, Any], authorities: dict[str, Any], gate_id: str, authority_role: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    """Resolve and validate the gate/authority/requirement/assignment eligibility
+    shared by every human-approval-recording adapter (record_github_approval,
+    record_gitlab_approval, record_gate_decision). Extracted after the third
+    near-verbatim copy of this block let one adapter's dedup filter silently
+    diverge from the other two -- a shared helper removes the recurring risk,
+    not just the duplication. Raises the same ValueError messages every existing
+    adapter already raised, so behavior for all three is unchanged."""
+    gate = next((item for item in record.get("lifecycle_gates", []) if item.get("gate_id") == gate_id), None)
+    if gate is None:
+        raise ValueError(f"unknown gate in run record: {gate_id}")
+    authority = authorities.get(authority_role)
+    if not isinstance(authority, dict):
+        raise ValueError(f"unknown authority role: {authority_role}")
+    requirement = human_requirement_for_gate(gate, authority_role)
+    if requirement is None:
+        raise ValueError(f"{gate_id} does not require authority role {authority_role}")
+    if requirement.get("applicability") != "applicable":
+        raise ValueError(f"{gate_id} authority role {authority_role} is not applicable")
+    expected_assignee = authority.get("assignee")
+    if authority.get("status") != "assigned" or not expected_assignee:
+        raise ValueError(f"authority {authority_role} is not assigned")
+    return gate, authority, requirement, expected_assignee
+
+
+def _replace_approval_entry(
+    existing: list[dict[str, Any]], approver_id: str, role_label: str, new_entry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Replace a prior *approved* entry by the same approver id+role with
+    new_entry, preserving any other-status history (e.g. a prior rejection's
+    own evidence/rationale is never silently dropped) -- matches the semantics
+    record_github_approval/record_gitlab_approval already had."""
+    remaining = [
+        item
+        for item in existing
+        if not (
+            item.get("status") == "approved"
+            and isinstance(item.get("approver"), dict)
+            and item["approver"].get("id") == approver_id
+            and item["approver"].get("role") == role_label
+        )
+    ]
+    remaining.append(new_entry)
+    return remaining
+
+
 def record_github_approval(
     root: Path,
     task_id: str,
@@ -623,20 +671,7 @@ def record_github_approval(
     path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
     record = load_json(path)
     approval_source_policy(project)
-    gate = next((item for item in record.get("lifecycle_gates", []) if item.get("gate_id") == gate_id), None)
-    if gate is None:
-        raise ValueError(f"unknown gate in run record: {gate_id}")
-    authority = authorities.get(authority_role)
-    if not isinstance(authority, dict):
-        raise ValueError(f"unknown authority role: {authority_role}")
-    requirement = human_requirement_for_gate(gate, authority_role)
-    if requirement is None:
-        raise ValueError(f"{gate_id} does not require authority role {authority_role}")
-    if requirement.get("applicability") != "applicable":
-        raise ValueError(f"{gate_id} authority role {authority_role} is not applicable")
-    expected_assignee = authority.get("assignee")
-    if authority.get("status") != "assigned" or not expected_assignee:
-        raise ValueError(f"authority {authority_role} is not assigned")
+    gate, authority, requirement, expected_assignee = _resolve_gate_authority(record, authorities, gate_id, authority_role)
     expected_login = authority_github_login(authority)
     normalized_reviewer_login = reviewer_login.lower()
     normalized_expected_login = expected_login.lower() if isinstance(expected_login, str) else None
@@ -674,18 +709,7 @@ def record_github_approval(
             "classification": record.get("classification", project.get("classification", "internal")),
         }],
     }
-    remaining = [
-        item
-        for item in gate.get("human_approvals", [])
-        if not (
-            item.get("status") == "approved"
-            and isinstance(item.get("approver"), dict)
-            and item["approver"].get("id") == expected_assignee
-            and item["approver"].get("role") == role_label
-        )
-    ]
-    remaining.append(approval)
-    gate["human_approvals"] = remaining
+    gate["human_approvals"] = _replace_approval_entry(gate.get("human_approvals", []), expected_assignee, role_label, approval)
     if can_mark_gate_approved(record, gate, authorities):
         gate["status"] = "approved"
         gate["decided_at"] = max(
@@ -726,20 +750,7 @@ def record_gitlab_approval(
     path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
     record = load_json(path)
     approval_source_policy(project)
-    gate = next((item for item in record.get("lifecycle_gates", []) if item.get("gate_id") == gate_id), None)
-    if gate is None:
-        raise ValueError(f"unknown gate in run record: {gate_id}")
-    authority = authorities.get(authority_role)
-    if not isinstance(authority, dict):
-        raise ValueError(f"unknown authority role: {authority_role}")
-    requirement = human_requirement_for_gate(gate, authority_role)
-    if requirement is None:
-        raise ValueError(f"{gate_id} does not require authority role {authority_role}")
-    if requirement.get("applicability") != "applicable":
-        raise ValueError(f"{gate_id} authority role {authority_role} is not applicable")
-    expected_assignee = authority.get("assignee")
-    if authority.get("status") != "assigned" or not expected_assignee:
-        raise ValueError(f"authority {authority_role} is not assigned")
+    gate, authority, requirement, expected_assignee = _resolve_gate_authority(record, authorities, gate_id, authority_role)
     expected_username = authority_gitlab_username(authority)
     normalized_approver_username = approver_username.lower()
     normalized_expected_username = expected_username.lower() if isinstance(expected_username, str) else None
@@ -777,18 +788,7 @@ def record_gitlab_approval(
             "classification": record.get("classification", project.get("classification", "internal")),
         }],
     }
-    remaining = [
-        item
-        for item in gate.get("human_approvals", [])
-        if not (
-            item.get("status") == "approved"
-            and isinstance(item.get("approver"), dict)
-            and item["approver"].get("id") == expected_assignee
-            and item["approver"].get("role") == role_label
-        )
-    ]
-    remaining.append(approval)
-    gate["human_approvals"] = remaining
+    gate["human_approvals"] = _replace_approval_entry(gate.get("human_approvals", []), expected_assignee, role_label, approval)
     if can_mark_gate_approved(record, gate, authorities):
         gate["status"] = "approved"
         gate["decided_at"] = max(
@@ -801,6 +801,111 @@ def record_gitlab_approval(
         "gate_id": gate_id,
         "authority_id": authority_role,
         "approval_uri": approval_uri,
+        "gate_status": gate.get("status"),
+        "current_phase": derive_current_phase(record),
+    }
+
+
+def record_gate_decision(
+    root: Path,
+    task_id: str,
+    gate_id: str,
+    authority_role: str,
+    decision: str,
+    actor_id: str,
+    evidence_uri: str,
+    note: str | None,
+    decided_at: str | None,
+) -> dict[str, Any]:
+    """Record a platform-agnostic human decision (approved/rejected/request-changes)
+    for a gate. Unlike record_github_approval/record_gitlab_approval, the caller's
+    identity is asserted directly rather than derived from a platform review
+    payload, so the actor is required to match the assigned authority exactly, and
+    self-approval is refused synchronously against gate.preparers/independent_verifier
+    rather than relying solely on a later validate_repository() pass. An "approved"
+    decision is also checked synchronously against the project's approval_sources
+    policy (the same check validate_repository() performs, but here at write time):
+    a project that requires github-review/gitlab-mr sourcing with no manual
+    fallback cannot be satisfied by an arbitrary --evidence-uri string."""
+    if decision not in {"approved", "rejected", "request-changes"}:
+        raise ValueError(f"unknown decision: {decision}")
+    _, project, authorities, _, _ = load_overlay(root)
+    path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
+    record = load_json(path)
+    approval_policy = approval_source_policy(project)
+    gate, authority, requirement, expected_assignee = _resolve_gate_authority(record, authorities, gate_id, authority_role)
+    if actor_id != expected_assignee:
+        raise ValueError(f"actor {actor_id} does not match assigned authority {expected_assignee} for role {authority_role}")
+    preparers = {item.get("id") for item in gate.get("preparers", []) if isinstance(item, dict)}
+    verifier = gate.get("independent_verifier")
+    verifier_id = verifier.get("id") if isinstance(verifier, dict) else None
+    if actor_id in preparers:
+        raise ValueError(f"{authority_role} authority {actor_id} is a preparer for {gate_id}; cannot decide on own work")
+    if verifier_id and actor_id == verifier_id:
+        raise ValueError(f"{authority_role} authority {actor_id} is the independent verifier for {gate_id}; cannot also decide")
+    if not evidence_uri:
+        raise ValueError("--evidence-uri is required")
+    if decision == "approved":
+        if (
+            approval_policy["human_gate_default"] == "github-review"
+            and not approval_policy["allow_manual_fallback"]
+            and (not evidence_uri.startswith("github-review:") or parse_github_review_uri(evidence_uri) is None)
+        ):
+            raise ValueError(f"{gate_id} approval must be backed by a GitHub review (project approval_sources requires github-review)")
+        if (
+            approval_policy["human_gate_default"] == "gitlab-mr"
+            and not approval_policy["allow_manual_fallback"]
+            and (not evidence_uri.startswith("gitlab-mr:") or parse_gitlab_mr_uri(evidence_uri) is None)
+        ):
+            raise ValueError(f"{gate_id} approval must be backed by a GitLab MR approval (project approval_sources requires gitlab-mr)")
+    chosen_time = decided_at or now()
+    if not is_valid_datetime(chosen_time):
+        raise ValueError("--decided-at must be a valid RFC 3339 date-time")
+    role_label = requirement.get("role")
+    evidence_payload = {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "decision": decision,
+        "actor_id": actor_id,
+        "evidence_uri": evidence_uri,
+        "decided_at": chosen_time,
+    }
+    approval_status = "approved" if decision == "approved" else "rejected"
+    approval: dict[str, Any] = {
+        "status": approval_status,
+        "approver": {"id": actor_id, "role": role_label, "kind": "human"},
+        "decided_at": chosen_time,
+        "evidence_refs": [{
+            "evidence_id": f"{gate_id.lower()}-{authority_role}-decide-{fingerprint(evidence_payload).removeprefix('sha256:')[:12]}",
+            "uri": evidence_uri,
+            "hash_algorithm": "sha256",
+            "hash": fingerprint(evidence_payload).removeprefix("sha256:"),
+            "classification": record.get("classification", project.get("classification", "internal")),
+        }],
+    }
+    if note:
+        approval["note"] = note
+    gate["human_approvals"] = _replace_approval_entry(gate.get("human_approvals", []), actor_id, role_label, approval)
+    if decision != "approved" and gate.get("status") == "approved":
+        gate["status"] = "pending"
+    if decision == "approved" and can_mark_gate_approved(record, gate, authorities):
+        gate["status"] = "approved"
+        gate["decided_at"] = max(
+            [approval_item.get("decided_at") for approval_item in approved_human_approvals(gate) if approval_item.get("decided_at")] or [chosen_time]
+        )
+        record["current_lifecycle_phase"] = derive_current_phase(record)
+    elif decision == "request-changes":
+        gate["status"] = "request-changes"
+        gate["decided_at"] = chosen_time
+        record["current_lifecycle_phase"] = derive_current_phase(record)
+    write_json(path, record)
+    return {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "decision": decision,
+        "actor_id": actor_id,
         "gate_status": gate.get("status"),
         "current_phase": derive_current_phase(record),
     }
@@ -2280,6 +2385,24 @@ def approve_from_gitlab(args: argparse.Namespace) -> int:
     return 0
 
 
+def decide_gate(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    result = record_gate_decision(
+        root,
+        task_id,
+        args.gate,
+        args.role,
+        args.decision,
+        args.actor_id,
+        args.evidence_uri,
+        args.note,
+        args.decided_at,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def approve_from_gitlab_mr(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     task_id = safe_task_id(args.task_id)
@@ -2448,6 +2571,18 @@ def build_parser() -> argparse.ArgumentParser:
     link_requirements.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
     link_requirements.add_argument("--issue-iid", type=int, required=True, help="Issue internal ID (iid)")
     link_requirements.set_defaults(handler=link_requirements_from_gitlab_issue)
+    decide = subparsers.add_parser("decide", help="Record a human decision (approved/rejected/request-changes) for a lifecycle gate")
+    decide.add_argument("--root", default=".")
+    decide.add_argument("--task-id", required=True)
+    decide.add_argument("--gate", choices=GATE_IDS, required=True)
+    decide.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True)
+    decide.add_argument("--decision", choices=["approved", "rejected", "request-changes"], required=True)
+    decide.add_argument("--actor-id", required=True, help="Identity recording the decision; must match the assigned authority for --role")
+    decide.add_argument("--evidence-uri", required=True, help="External evidence reference for this decision")
+    decide.add_argument("--note", help="Optional human-readable rationale")
+    decide.add_argument("--decided-at", help="RFC 3339 timestamp; defaults to now")
+    decide.set_defaults(handler=decide_gate)
+
     invalid = subparsers.add_parser("invalidate", help="Invalidate the earliest affected gate and all downstream gates")
     invalid.add_argument("--root", default=".")
     invalid.add_argument("--task-id", required=True)

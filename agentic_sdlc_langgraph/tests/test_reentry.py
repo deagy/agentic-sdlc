@@ -86,7 +86,13 @@ def _initial_state(task_id: str) -> dict:
 _APPROVAL = {
     "status": "approved",
     "approver": {"id": "product_owner", "role": "Product Owner", "kind": "human"},
-    "evidence_refs": [],
+    "evidence_refs": [{
+        "evidence_id": "test-evidence",
+        "uri": "test-evidence:manual",
+        "hash_algorithm": "sha256",
+        "hash": "0" * 64,
+        "classification": "internal",
+    }],
 }
 
 

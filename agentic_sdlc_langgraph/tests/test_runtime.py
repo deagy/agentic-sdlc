@@ -91,7 +91,17 @@ def test_later_call_rebuilds_identical_graph_without_task_text(tmp_path: Path):
     assert snapshot.values["scope"] == TASK_TEXT
     assert snapshot.interrupts[0].value["gate_id"] == "G1"
 
-    approval = {"status": "approved", "approver": {"id": "x", "role": "x", "kind": "human"}, "evidence_refs": []}
+    approval = {
+        "status": "approved",
+        "approver": {"id": "x", "role": "x", "kind": "human"},
+        "evidence_refs": [{
+            "evidence_id": "test-evidence",
+            "uri": "test-evidence:manual",
+            "hash_algorithm": "sha256",
+            "hash": "0" * 64,
+            "classification": "internal",
+        }],
+    }
     result = graph2.invoke(Command(resume=approval), config=config2)
     assert result["__interrupt__"][0].value["gate_id"] == "G2"
 
@@ -414,7 +424,17 @@ def test_status_summary_unaffected_for_completed_task(tmp_path: Path):
     graph, config, metadata = runtime.build_graph_for_task(
         tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
     )
-    approval = {"status": "approved", "approver": {"id": "x", "role": "x", "kind": "human"}, "evidence_refs": []}
+    approval = {
+        "status": "approved",
+        "approver": {"id": "x", "role": "x", "kind": "human"},
+        "evidence_refs": [{
+            "evidence_id": "test-evidence",
+            "uri": "test-evidence:manual",
+            "hash_algorithm": "sha256",
+            "hash": "0" * 64,
+            "classification": "internal",
+        }],
+    }
     graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
     for _ in range(3):
         graph.invoke(Command(resume=approval), config=config)
@@ -423,6 +443,66 @@ def test_status_summary_unaffected_for_completed_task(tmp_path: Path):
     assert summary["interrupted"] is False
     assert summary["interrupt_payload_unavailable"] is False
     assert summary["pending_interrupt_node"] is None
+
+
+def test_resume_approved_without_evidence_does_not_approve_gate(tmp_path: Path):
+    """A resumed decision claiming `status: "approved"` with no well-formed
+    evidence_refs must not be accepted as approval -- the engine downgrades
+    it to "rejected"/"request-changes" instead of trusting the caller's
+    unverified claim (see graph.py's human_approval `_has_valid_evidence`
+    check)."""
+    from langgraph.types import Command
+
+    checkpointer = _memory_checkpointer()
+    graph, config, _metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+
+    approval = {"status": "approved", "approver": {"id": "x", "role": "x", "kind": "human"}, "evidence_refs": []}
+    graph.invoke(Command(resume=approval), config=config)
+
+    snapshot = graph.get_state(config)
+    gate = snapshot.values["lifecycle_gates"]["G1"]
+    assert gate["status"] == "request-changes"
+    assert gate["human_approvals"][-1]["status"] == "rejected"
+
+
+def test_resume_approved_by_a_preparer_does_not_approve_gate(tmp_path: Path):
+    """A resumed decision with well-formed evidence but whose `approver.id`
+    is one of the gate's own preparers must not be accepted as approval --
+    the engine now checks this synchronously (matching the kernel's `decide`
+    command's gate.preparers/independent_verifier refusal), not only via the
+    separate, later validate.py pass."""
+    from langgraph.types import Command
+
+    checkpointer = _memory_checkpointer()
+    graph, config, _metadata = runtime.build_graph_for_task(
+        tmp_path, "task-1", task_text=TASK_TEXT, model_client=FakeModelClient(), checkpointer=checkpointer
+    )
+    graph.invoke(runtime.initial_state("task-1", TASK_TEXT), config=config)
+
+    snapshot = graph.get_state(config)
+    preparer_ids = [p["id"] for p in snapshot.values["lifecycle_gates"]["G1"]["preparers"]]
+    assert preparer_ids, "G1 must have a real preparer for this test to be meaningful"
+
+    approval = {
+        "status": "approved",
+        "approver": {"id": preparer_ids[0], "role": "x", "kind": "human"},
+        "evidence_refs": [{
+            "evidence_id": "test-evidence",
+            "uri": "test-evidence:manual",
+            "hash_algorithm": "sha256",
+            "hash": "0" * 64,
+            "classification": "internal",
+        }],
+    }
+    graph.invoke(Command(resume=approval), config=config)
+
+    snapshot = graph.get_state(config)
+    gate = snapshot.values["lifecycle_gates"]["G1"]
+    assert gate["status"] == "request-changes"
+    assert gate["human_approvals"][-1]["status"] == "rejected"
 
 
 def test_invalidate_gates_does_not_blind_status_to_still_pending_interrupt(tmp_path: Path):

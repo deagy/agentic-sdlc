@@ -478,6 +478,159 @@ class V03MigrationTests(unittest.TestCase):
             result["errors"],
         )
 
+    def test_decide_approves_gate_and_records_evidence(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-1", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-1",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:decision-record-1",
+            "--note", "Looks good",
+            "--decided-at", "2030-01-01T00:00:00Z",
+        )
+        self.assertEqual("approved", result["decision"])
+        record = self.load(".agentic-sdlc/runs/DEC-1/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        approval = gate["human_approvals"][0]
+        self.assertEqual("approved", approval["status"])
+        self.assertEqual("alice", approval["approver"]["id"])
+        self.assertEqual("Looks good", approval["note"])
+        evidence = approval["evidence_refs"][0]
+        self.assertEqual("doc:decision-record-1", evidence["uri"])
+        self.assertEqual("sha256", evidence["hash_algorithm"])
+
+    def test_decide_rejected_leaves_gate_unapproved(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-2", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-2",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "rejected",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:decision-record-2",
+        )
+        self.assertNotEqual("approved", result["gate_status"])
+        record = self.load(".agentic-sdlc/runs/DEC-2/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual("rejected", gate["human_approvals"][0]["status"])
+
+    def test_decide_request_changes_sets_gate_status(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-3", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-3",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "request-changes",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:decision-record-3",
+        )
+        self.assertEqual("request-changes", result["gate_status"])
+        record = self.load(".agentic-sdlc/runs/DEC-3/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual("request-changes", gate["status"])
+
+    def test_decide_refuses_actor_mismatch(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-4", "--task", "Create the service architecture", provider=True)
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-4",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "mallory",
+            "--evidence-uri", "doc:decision-record-4",
+            expected=1,
+        )
+        self.assertIn("does not match assigned authority", result["error"])
+
+    def test_decide_refuses_self_decision_as_preparer(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-5", "--task", "Create the service architecture", provider=True)
+        record_relative = ".agentic-sdlc/runs/DEC-5/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["preparers"] = [{"id": "alice", "role": "Product Owner", "kind": "human"}]
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-5",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:decision-record-5",
+            expected=1,
+        )
+        self.assertIn("is a preparer", result["error"])
+
+    def test_decide_refuses_self_decision_as_verifier(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-6", "--task", "Create the service architecture", provider=True)
+        record_relative = ".agentic-sdlc/runs/DEC-6/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["independent_verifier"] = {"id": "alice", "role": "Independent Verifier", "kind": "human"}
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-6",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "approved",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:decision-record-6",
+            expected=1,
+        )
+        self.assertIn("is the independent verifier", result["error"])
+
+    def test_decide_downgrades_previously_approved_gate_on_rejection(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner", assignee="alice")
+        self.run_cli("plan", "--task-id", "DEC-7", "--task", "Create the service architecture", provider=True)
+        record_relative = ".agentic-sdlc/runs/DEC-7/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["status"] = "approved"
+        gate["human_approvals"] = [{
+            "status": "approved",
+            "approver": {"id": "alice", "role": "Product Owner", "kind": "human"},
+            "decided_at": "2030-01-01T00:00:00Z",
+            "evidence_refs": [{"evidence_id": "seed", "uri": "doc:seed", "hash_algorithm": "sha256", "hash": "0" * 64, "classification": "internal"}],
+        }]
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.run_cli(
+            "decide",
+            "--task-id", "DEC-7",
+            "--gate", "G1",
+            "--role", "product_owner",
+            "--decision", "rejected",
+            "--actor-id", "alice",
+            "--evidence-uri", "doc:decision-record-7",
+        )
+        self.assertEqual("pending", result["gate_status"])
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual("pending", gate["status"])
+        self.assertEqual("rejected", gate["human_approvals"][0]["status"])
+
     def _approved_g1_gate(self, task_id, verifier):
         # Shared setup for the three regression tests below (issue #9):
         # a gate that has already cleared every *other* approved-gate

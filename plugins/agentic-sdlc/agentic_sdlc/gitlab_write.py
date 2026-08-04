@@ -29,6 +29,17 @@ extend the *same* mock-file convention with additional top-level keys
 (`"users"`, `"assignee_update"`, `"link"`) documented on each function --
 this repository's own extension of that convention, not a divergence from
 the ported functions above them.
+
+`list_mr_notes`/`create_mr_note`/`update_mr_note`/`fetch_mr_note` are a
+further extension for `publish-gate-status` / `list-gate-status`
+(`agentic_sdlc/gate_status.py`), reusing the same `ISSUE_CREATE_MOCK_ENV_VAR`
+mock file with new top-level keys (`"notes_list"`, `"notes_create"`,
+`"notes_update"`, `"notes_fetch"`) rather than a distinct env var, since
+they mirror the issue-comment functions' shape. They operate on GitLab's MR
+"notes" endpoint, not the issue "comments"/"discussions" endpoints used
+above -- a merge request's notes are a materially different resource from a
+GitLab issue's, even though both are called "notes" in GitLab's own API
+terminology.
 """
 
 from __future__ import annotations
@@ -364,6 +375,136 @@ class IssueLinksUnavailable(ValueError):
     available on the target instance (403/404) -- callers must fail closed
     (`gate_issues.py` §4.2), never silently downgrade to skipping the
     link."""
+
+
+def list_mr_notes(project_path: str, mr_iid: int, *, page: int, per_page: int = 100) -> list[dict[str, Any]]:
+    """`GET projects/:id/merge_requests/:iid/notes?per_page=<n>&page=<p>` --
+    one page of an MR's notes (GitLab's term for both regular comments and
+    system-generated activity notes). Used by `gate_status.py`'s
+    `GitlabForgeAdapter`, which owns pagination and the `MAX_COMMENT_PAGES`
+    cap; this function fetches exactly one page. Mirrors the issue-comment
+    functions above rather than a widening of them -- MRs use GitLab's
+    "notes" endpoint, not "comments" (that terminology is GitLab-issue-only).
+    Mock convention: `mock["notes_list"][f"{project_path}:{mr_iid}"][str(page)]`
+    is that page's raw note array (missing key == empty page)."""
+    mock = _load_issue_create_mock()
+    key = f"{project_path}:{mr_iid}"
+    if mock is not None:
+        raw = mock.get("notes_list", {}).get(key, {}).get(str(page), [])
+        if not isinstance(raw, list):
+            raise ValueError(f"mocked notes_list response for {key!r} page {page} must be a JSON array")
+        return raw
+
+    encoded_project = quote(project_path, safe="")
+    result = _run_glab(
+        ["glab", "api", f"projects/{encoded_project}/merge_requests/{mr_iid}/notes?per_page={per_page}&page={page}"]
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+        raise ValueError(f"unable to list MR notes for {project_path} MR {mr_iid} page {page}: {detail}")
+    raw = _parse_glab_json(result.stdout, "list_mr_notes")
+    if not isinstance(raw, list):
+        raise ValueError("GitLab MR notes response must be a JSON array")
+    return raw
+
+
+def create_mr_note(project_path: str, mr_iid: int, body: str) -> int:
+    """`POST projects/:id/merge_requests/:iid/notes`. Mock convention:
+    `mock["notes_create"][f"{project_path}:{mr_iid}"]` is `{"id": <int>}`."""
+    key = f"{project_path}:{mr_iid}"
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("notes_create", {}).get(key)
+        if not isinstance(raw, dict):
+            raise ValueError(f"mocked notes_create response for {key!r} must be a JSON object")
+    else:
+        encoded_project = quote(project_path, safe="")
+        body_payload = {"body": body}
+        tmp_dir = tempfile.mkdtemp(prefix="agentic-sdlc-glab-note-")
+        try:
+            fd, body_path = tempfile.mkstemp(dir=tmp_dir, prefix="note-", suffix=".json")
+            try:
+                os.write(fd, json.dumps(body_payload).encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.chmod(body_path, 0o600)
+            argv = [
+                "glab", "api", f"projects/{encoded_project}/merge_requests/{mr_iid}/notes",
+                "--method", "POST", "--input", body_path,
+            ]
+            result = subprocess.run(argv, cwd=tmp_dir, capture_output=True, timeout=_GLAB_TIMEOUT_SECONDS, check=False)
+        finally:
+            for entry in Path(tmp_dir).glob("note-*"):
+                entry.unlink(missing_ok=True)
+            Path(tmp_dir).rmdir()
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+            raise ValueError(f"unable to create MR note on {project_path} MR {mr_iid}: {detail}")
+        raw = _parse_glab_json(result.stdout, "create_mr_note")
+        if not isinstance(raw, dict):
+            raise ValueError("GitLab MR note create response must be a JSON object")
+
+    note_id = raw.get("id")
+    if not isinstance(note_id, int):
+        raise ValueError("GitLab MR note create response is missing an integer 'id'")
+    return note_id
+
+
+def update_mr_note(project_path: str, mr_iid: int, note_id: int, body: str) -> None:
+    """`PUT projects/:id/merge_requests/:iid/notes/:note_id`. Mock
+    convention: `mock["notes_update"][str(note_id)]` is either any JSON
+    object (success) or `{"error": "<message>"}` (raises with that
+    message)."""
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("notes_update", {}).get(str(note_id), {})
+        if isinstance(raw, dict) and "error" in raw:
+            raise ValueError(f"unable to update MR note {note_id}: {raw['error']}")
+        return
+    encoded_project = quote(project_path, safe="")
+    body_payload = {"body": body}
+    tmp_dir = tempfile.mkdtemp(prefix="agentic-sdlc-glab-note-update-")
+    try:
+        fd, body_path = tempfile.mkstemp(dir=tmp_dir, prefix="note-", suffix=".json")
+        try:
+            os.write(fd, json.dumps(body_payload).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(body_path, 0o600)
+        argv = [
+            "glab", "api", f"projects/{encoded_project}/merge_requests/{mr_iid}/notes/{note_id}",
+            "--method", "PUT", "--input", body_path,
+        ]
+        result = subprocess.run(argv, cwd=tmp_dir, capture_output=True, timeout=_GLAB_TIMEOUT_SECONDS, check=False)
+    finally:
+        for entry in Path(tmp_dir).glob("note-*"):
+            entry.unlink(missing_ok=True)
+        Path(tmp_dir).rmdir()
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+        raise ValueError(f"unable to update MR note {note_id} for {project_path} MR {mr_iid}: {detail}")
+
+
+def fetch_mr_note(project_path: str, mr_iid: int, note_id: int) -> dict[str, Any]:
+    """`GET projects/:id/merge_requests/:iid/notes/:note_id` -- used only
+    for the post-create/post-update re-fetch-and-verify step
+    (`gate_status.py` section 3). Mock convention:
+    `mock["notes_fetch"][str(note_id)]` is the raw note object."""
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("notes_fetch", {}).get(str(note_id))
+        if not isinstance(raw, dict):
+            raise ValueError(f"mocked notes_fetch response for note {note_id} must be a JSON object")
+        return raw
+    encoded_project = quote(project_path, safe="")
+    result = _run_glab(["glab", "api", f"projects/{encoded_project}/merge_requests/{mr_iid}/notes/{note_id}"])
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+        raise ValueError(f"unable to fetch MR note {note_id} for {project_path} MR {mr_iid}: {detail}")
+    raw = _parse_glab_json(result.stdout, "fetch_mr_note")
+    if not isinstance(raw, dict):
+        raise ValueError("GitLab MR note fetch response must be a JSON object")
+    return raw
 
 
 def create_gitlab_issue_link(

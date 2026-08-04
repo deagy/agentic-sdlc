@@ -1054,6 +1054,244 @@ class V03MigrationTests(unittest.TestCase):
             result["errors"],
         )
 
+    def test_parse_github_issue_uri(self):
+        parsed = agentic_sdlc.parse_github_issue_uri("github-issue:owner/project:issues/42")
+        self.assertEqual({"owner": "owner", "repo": "project", "number": "42"}, parsed)
+        self.assertIsNone(agentic_sdlc.parse_github_issue_uri("github-issue:missing-fields"))
+        self.assertIsNone(agentic_sdlc.parse_github_issue_uri("gitlab-issue:group/project:issues/42"))
+
+    def test_fetch_github_issue_via_mock(self):
+        mock_path = self.root / "github-issue-mock.json"
+        mock_path.write_text(json.dumps({
+            "number": 42,
+            "title": "Support SSO login for enterprise customers",
+            "state": "open",
+            "html_url": "https://github.com/owner/project/issues/42",
+            "updated_at": "2030-01-01T00:00:00Z",
+        }), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENTIC_SDLC_TEST_GITHUB_ISSUE_FILE": str(mock_path)}):
+            issue = agentic_sdlc.fetch_github_issue("owner/project", 42)
+        self.assertEqual(
+            {
+                "iid": 42,
+                "title": "Support SSO login for enterprise customers",
+                "state": "open",
+                "web_url": "https://github.com/owner/project/issues/42",
+                "updated_at": "2030-01-01T00:00:00Z",
+            },
+            issue,
+        )
+
+    def test_fetch_github_issue_rejects_missing_title(self):
+        mock_path = self.root / "github-issue-bad.json"
+        mock_path.write_text(json.dumps({"number": 99, "state": "open"}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENTIC_SDLC_TEST_GITHUB_ISSUE_FILE": str(mock_path)}):
+            with self.assertRaises(ValueError):
+                agentic_sdlc.fetch_github_issue("owner/project", 99)
+
+    def test_fetch_github_issue_surfaces_gh_api_failure(self):
+        # Exercises the real (non-mock) subprocess path: a nonzero `gh api`
+        # exit code must raise a ValueError naming the repo/issue, not
+        # propagate a raw CalledProcessError or crash on invalid JSON.
+        failed = subprocess.CompletedProcess(args=["gh"], returncode=1, stdout="", stderr="404 Not Found")
+        environ_without_mock_file = dict(os.environ)
+        environ_without_mock_file.pop("AGENTIC_SDLC_TEST_GITHUB_ISSUE_FILE", None)
+        with mock.patch.dict(os.environ, environ_without_mock_file, clear=True):
+            with mock.patch("agentic_sdlc.subprocess.run", return_value=failed) as run_mock:
+                with self.assertRaises(ValueError) as raised:
+                    agentic_sdlc.fetch_github_issue("owner/project", 404)
+        run_mock.assert_called_once_with(
+            ["gh", "api", "repos/owner/project/issues/404"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertIn("unable to fetch GitHub issue for owner/project issue 404", str(raised.exception))
+        self.assertIn("404 Not Found", str(raised.exception))
+
+    def _link_from_github_issue(self, command, **overrides):
+        mock_path = self.root / "github-issue-link-mock.json"
+        mock_path.write_text(json.dumps({
+            "number": overrides.get("issue_number", 42),
+            "title": overrides.get("title", "Support SSO login for enterprise customers"),
+            "state": overrides.get("state", "open"),
+            "html_url": "https://github.com/owner/project/issues/42",
+            "updated_at": "2030-01-01T00:00:00Z",
+        }), encoding="utf-8")
+        return self.run_cli(
+            command,
+            "--task-id", overrides["task_id"],
+            "--role", overrides["role"],
+            "--repo", overrides.get("repo", "owner/project"),
+            "--issue-number", str(overrides.get("issue_number", 42)),
+            expected=overrides.get("expected", 0),
+            env={"AGENTIC_SDLC_TEST_GITHUB_ISSUE_FILE": str(mock_path)},
+        )
+
+    def test_link_intent_from_github_issue_records_evidence_and_sets_intent_record_id(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-1", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_github_issue(
+            "link-intent-from-github-issue", task_id="GHI-1", role="product_owner"
+        )
+        expected_uri = "github-issue:owner/project:issues/42"
+        self.assertEqual(expected_uri, result["issue_uri"])
+        self.assertEqual("intent_record_id", result["record_field"])
+        record = self.load(".agentic-sdlc/runs/GHI-1/run-record.json")
+        self.assertEqual(expected_uri, record["intent_record_id"])
+        self.assertIsNone(record["requirements_baseline_id"])
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        evidence = gate["evidence_refs"][0]
+        self.assertEqual(expected_uri, evidence["uri"])
+        self.assertEqual("sha256", evidence["hash_algorithm"])
+        self.assertEqual("g1-source-github-issue-42", evidence["evidence_id"])
+
+    def test_link_requirements_from_github_issue_records_evidence_and_sets_requirements_baseline_id(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("engineering_lead")
+        self.run_cli("plan", "--task-id", "GHI-2", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_github_issue(
+            "link-requirements-from-github-issue", task_id="GHI-2", role="engineering_lead"
+        )
+        expected_uri = "github-issue:owner/project:issues/42"
+        self.assertEqual("requirements_baseline_id", result["record_field"])
+        record = self.load(".agentic-sdlc/runs/GHI-2/run-record.json")
+        self.assertEqual(expected_uri, record["requirements_baseline_id"])
+        self.assertIsNone(record["intent_record_id"])
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G2")
+        self.assertEqual(expected_uri, gate["evidence_refs"][0]["uri"])
+
+    def test_link_intent_from_github_issue_rejects_unassigned_authority(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self.run_cli("plan", "--task-id", "GHI-3", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_github_issue(
+            "link-intent-from-github-issue", task_id="GHI-3", role="product_owner", expected=1
+        )
+        self.assertIn("is not applicable", result["error"])
+
+    def test_link_intent_from_github_issue_rejects_role_not_required_by_gate(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("engineering_lead")
+        self.run_cli("plan", "--task-id", "GHI-4", "--task", "Create the service architecture", provider=True)
+        result = self._link_from_github_issue(
+            "link-intent-from-github-issue", task_id="GHI-4", role="engineering_lead", expected=1
+        )
+        self.assertIn("does not require authority role", result["error"])
+
+    def test_record_github_issue_link_rejects_gates_other_than_g1_g2(self):
+        # The CLI subcommands hardcode G1/G2 (mirroring the GitLab ones), so
+        # this rejection is only reachable by calling the underlying
+        # recording function directly with an out-of-range gate id.
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-5", "--task", "Create the service architecture", provider=True)
+        with self.assertRaises(ValueError) as raised:
+            agentic_sdlc.record_github_issue_link(
+                self.root, "GHI-5", "G3", "product_owner", "owner/project",
+                {"iid": 42, "title": "T", "state": "open", "web_url": None},
+            )
+        self.assertIn("does not accept a GitHub issue source link", str(raised.exception))
+
+    def test_link_intent_from_github_issue_is_idempotent_on_relink(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-6", "--task", "Create the service architecture", provider=True)
+        self._link_from_github_issue("link-intent-from-github-issue", task_id="GHI-6", role="product_owner")
+        self._link_from_github_issue("link-intent-from-github-issue", task_id="GHI-6", role="product_owner")
+        record = self.load(".agentic-sdlc/runs/GHI-6/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual(1, len(gate["evidence_refs"]))
+
+    def test_link_intent_from_github_issue_does_not_affect_gate_approval_status(self):
+        # Regression pin for the confirmed invariant: linking a source issue
+        # must not touch human_approvals or gate.status. Compares the full
+        # gate object before/after (not just status), so any incidental
+        # field this adapter should never touch is caught, not only status.
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-7", "--task", "Create the service architecture", provider=True)
+        before = self.load(".agentic-sdlc/runs/GHI-7/run-record.json")
+        gate_before = next(item for item in before["lifecycle_gates"] if item["gate_id"] == "G1")
+        self._link_from_github_issue("link-intent-from-github-issue", task_id="GHI-7", role="product_owner")
+        after = self.load(".agentic-sdlc/runs/GHI-7/run-record.json")
+        gate_after = next(item for item in after["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual(gate_before["status"], gate_after["status"])
+        self.assertEqual([], gate_after["human_approvals"])
+        self.assertIsNone(gate_before.get("decided_at"))
+        self.assertIsNone(gate_after.get("decided_at"))
+        # Every other gate (G2-G10) must be completely untouched.
+        for gate_id in ("G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "G10"):
+            gate_before_other = next(item for item in before["lifecycle_gates"] if item["gate_id"] == gate_id)
+            gate_after_other = next(item for item in after["lifecycle_gates"] if item["gate_id"] == gate_id)
+            self.assertEqual(gate_before_other, gate_after_other, gate_id)
+
+    def test_relinking_a_different_github_issue_replaces_rather_than_accumulates_evidence(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-8", "--task", "Create the service architecture", provider=True)
+        self._link_from_github_issue(
+            "link-intent-from-github-issue", task_id="GHI-8", role="product_owner", issue_number=42
+        )
+        self._link_from_github_issue(
+            "link-intent-from-github-issue", task_id="GHI-8", role="product_owner", issue_number=99
+        )
+        record = self.load(".agentic-sdlc/runs/GHI-8/run-record.json")
+        self.assertEqual("github-issue:owner/project:issues/99", record["intent_record_id"])
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual(1, len(gate["evidence_refs"]))
+        self.assertEqual("github-issue:owner/project:issues/99", gate["evidence_refs"][0]["uri"])
+
+    def test_reenter_clears_the_paired_github_source_link_field_along_with_its_evidence(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-9", "--task", "Create the service architecture", provider=True)
+        self._link_from_github_issue("link-intent-from-github-issue", task_id="GHI-9", role="product_owner")
+        record = self.load(".agentic-sdlc/runs/GHI-9/run-record.json")
+        self.assertIsNotNone(record["intent_record_id"])
+        self.run_cli(
+            "invalidate", "--task-id", "GHI-9", "--earliest-gate", "G1",
+            "--reason", "Intent changed", "--actor", "product-owner",
+        )
+        self.run_cli(
+            "reenter", "--task-id", "GHI-9", "--earliest-gate", "G1",
+            "--reason", "Intent changed", "--actor", "product-owner",
+        )
+        record = self.load(".agentic-sdlc/runs/GHI-9/run-record.json")
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        self.assertEqual([], gate["evidence_refs"])
+        self.assertIsNone(record["intent_record_id"])
+
+    def test_validate_flags_malformed_github_issue_uri(self):
+        self.run_cli("init", "--profile", "generic", provider=True)
+        self._assign_authority("product_owner")
+        self.run_cli("plan", "--task-id", "GHI-10", "--task", "Create the service architecture", provider=True)
+        self._link_from_github_issue("link-intent-from-github-issue", task_id="GHI-10", role="product_owner")
+        record_relative = ".agentic-sdlc/runs/GHI-10/run-record.json"
+        record_path = self.root / record_relative
+        record = self.load(record_relative)
+        gate = next(item for item in record["lifecycle_gates"] if item["gate_id"] == "G1")
+        gate["evidence_refs"][0]["uri"] = "github-issue:malformed-uri-missing-fields"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.run_cli("validate", provider=True, expected=1)
+        self.assertTrue(
+            any("invalid GitHub issue URI" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_link_intent_from_github_and_gitlab_issue_are_mutually_exclusive_cli_subcommands(self):
+        # CLI wiring pin: both new subcommands are registered independently
+        # and each carries its own required flags (--repo/--issue-number for
+        # GitHub vs --project-path/--issue-iid for GitLab) -- one command's
+        # flags must not be silently accepted by the other.
+        result = subprocess.run(
+            CLI_COMMAND + ["link-intent-from-github-issue", "--task-id", "X", "--role", "product_owner",
+                           "--project-path", "group/project", "--issue-iid", "1", "--root", str(self.root)],
+            text=True, capture_output=True, check=False, env=cli_env(),
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--repo", result.stderr)
+
 
 class DevEntrypointCwdIsolationTests(unittest.TestCase):
     """dev_entrypoint.py must resolve the real kernel package regardless of

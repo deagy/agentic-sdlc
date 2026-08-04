@@ -41,10 +41,13 @@ issue are out of scope for v1.
 ## Idempotency
 
 GitLab (queried by label) is the source of truth, never the sidecar ledger
-at `<root>/.agentic-sdlc/runs/<task_id>/gate-issues.json` (+
-`gate-issues.lock`, a sibling pair of `requirement-issues.json`/`.lock` in
-the LangGraph engine package, `runtime.py:174-184` --
-`_requirement_ledger_path`/`_requirement_lock_path`). Existence is
+at `<root>/.agentic-sdlc/runs/<task_id>/gate-issues-<forge>.json` (+
+`gate-issues-<forge>.lock`; `<forge>` is `"gitlab"` today, the only forge
+this module supports -- see `FORGE_GITLAB` and `_ledger_path`/`_lock_path`
+below for why the filename is forge-qualified), a sibling pair of
+`requirement-issues.json`/`.lock` in the LangGraph engine package,
+`runtime.py:174-184` -- `_requirement_ledger_path`/`_requirement_lock_path`.
+Existence is
 determined by `search_gitlab_issues_by_labels(project, [FIXED_LABEL,
 <its own label>])`, `state=all`; `>1` match blocks (ambiguous identity),
 `1` match reuses (after label-containment + author-identity validation),
@@ -56,6 +59,7 @@ determined by `search_gitlab_issues_by_labels(project, [FIXED_LABEL,
 |---|---|---|
 | Gate issue | `"gate"`, `task_id`, `gate_id` | `agentic-sdlc-gate-` |
 | Approval issue | `"approval"`, `task_id`, `gate_id`, `authority_id` | `agentic-sdlc-approval-` |
+| Gate-status comment (`gate_status.py`, `publish-gate-status`) | `"gate-status"`, `task_id` (NUL-separated, `sha256`, `[:16]`) | n/a -- not a label; embedded in an HTML comment (`<!-- agentic-sdlc:gate-status:v1:<marker> -->`) on a PR/MR comment, not a GitLab issue label |
 
 This is domain-separated from the LangGraph engine package's
 `requirement_issues.compute_marker(task_id, gate_id, item_key)` (no
@@ -155,18 +159,27 @@ import hashlib
 import json
 import os
 import re
-import socket
-import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import CONTRACTS, GATE_IDS, OVERLAY, authority_gitlab_username, confined_path, fingerprint, load_json, now
-from . import gitlab_write
+from . import _forge_ledger, gitlab_write
 
 MAX_ISSUES_PER_RUN = 40
 LEDGER_SCHEMA_VERSION = 1
+
+# The sidecar ledger/lock filenames are forge-qualified (`forge` threaded
+# explicitly through `_ledger_path`/`_lock_path`/`read_ledger`/`write_ledger`/
+# `acquire_lock`, not a hidden convention) so a future GitHub-side
+# `create-gate-issues` equivalent naturally gets its own
+# `gate-issues-github.json`/`.lock` sidecar rather than colliding with (and
+# silently clobbering) this GitLab-only implementation's ledger if the same
+# `task_id` is ever tracked against two forges -- e.g. a project migrating
+# from GitLab to GitHub. `create-gate-issues` is GitLab-only today, so
+# `FORGE_GITLAB` is the only value in use.
+FORGE_GITLAB = "gitlab"
 
 FIXED_LABEL = gitlab_write.FIXED_LABEL
 GATE_LABEL_PREFIX = "agentic-sdlc-gate-"
@@ -635,15 +648,24 @@ def compute_plan_digest(
 
 # --------------------------------------------------------------------------
 # Sidecar ledger (diagnostics only, never trusted for existence)
+#
+# `forge` qualifies both the ledger and lock filenames (see `FORGE_GITLAB`
+# above for why). No migration path is provided for pre-existing
+# unqualified `gate-issues.json`/`gate-issues.lock` files from before this
+# rename: the ledger is documented as diagnostics-only above (idempotency
+# is via GitLab label search, never the ledger), so a stale/orphaned old
+# ledger file causes no correctness problem -- it is simply never read
+# again. Building migration logic for a diagnostics-only sidecar would
+# solve a problem this module's own design already avoids.
 # --------------------------------------------------------------------------
 
 
-def _ledger_path(root: Path, task_id: str) -> Path:
-    return confined_path(root, OVERLAY, "runs", task_id, "gate-issues.json")
+def _ledger_path(root: Path, task_id: str, forge: str = FORGE_GITLAB) -> Path:
+    return _forge_ledger.ledger_path(Path(root), OVERLAY, task_id, f"gate-issues-{forge}.json")
 
 
-def _lock_path(root: Path, task_id: str) -> Path:
-    return confined_path(root, OVERLAY, "runs", task_id, "gate-issues.lock")
+def _lock_path(root: Path, task_id: str, forge: str = FORGE_GITLAB) -> Path:
+    return _forge_ledger.lock_path(Path(root), OVERLAY, task_id, f"gate-issues-{forge}.lock")
 
 
 def _empty_ledger(task_id: str) -> dict[str, Any]:
@@ -657,68 +679,32 @@ def _empty_ledger(task_id: str) -> dict[str, Any]:
     }
 
 
-def read_ledger(root: Path, task_id: str) -> dict[str, Any]:
-    path = _ledger_path(Path(root), task_id)
+def read_ledger(root: Path, task_id: str, forge: str = FORGE_GITLAB) -> dict[str, Any]:
+    path = _ledger_path(Path(root), task_id, forge)
     if not path.is_file():
         return _empty_ledger(task_id)
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_ledger(root: Path, task_id: str, ledger: dict[str, Any]) -> None:
+def write_ledger(root: Path, task_id: str, ledger: dict[str, Any], forge: str = FORGE_GITLAB) -> None:
     """Same durable-write sequence as the LangGraph engine package's
-    `requirement_issues.write_ledger`: full-file rewrite, same-filesystem
-    tmp file, fsync data, atomic rename, fsync the containing directory."""
-    path = _ledger_path(Path(root), task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = (json.dumps(ledger, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    `requirement_issues.write_ledger` (now shared via `_forge_ledger.py`,
+    also used by `gate_status.py`): full-file rewrite, same-filesystem tmp
+    file, fsync data, atomic rename, fsync the containing directory."""
+    path = _ledger_path(Path(root), task_id, forge)
+    _forge_ledger.write_ledger_file(path, ledger, tmp_prefix=".gate-issues.")
 
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".gate-issues.", suffix=".tmp")
+
+def acquire_lock(root: Path, task_id: str, *, break_lock: bool, forge: str = FORGE_GITLAB) -> Path:
+    path = _lock_path(Path(root), task_id, forge)
     try:
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.chmod(tmp_name, 0o600)
-    os.replace(tmp_name, path)
-
-    dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
-def acquire_lock(root: Path, task_id: str, *, break_lock: bool) -> Path:
-    path = _lock_path(Path(root), task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if break_lock and path.is_file():
-        path.unlink(missing_ok=True)
-
-    try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        holder = "(unreadable)"
-        try:
-            holder = path.read_text(encoding="utf-8")
-        except OSError:
-            pass
-        raise GateIssuesBlocked(
-            f"gate-issues.lock is already held -- pass --break-lock to override "
-            f"(never auto-broken on timeout). Holder:\n{holder}"
-        ) from None
-
-    payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "started_at": now()}, indent=2)
-    os.write(fd, payload.encode("utf-8"))
-    os.close(fd)
-    return path
+        return _forge_ledger.acquire_lock_file(path, break_lock=break_lock)
+    except _forge_ledger.LedgerLockHeld as exc:
+        raise GateIssuesBlocked(str(exc)) from None
 
 
 def release_lock(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+    _forge_ledger.release_lock_file(path)
 
 
 # --------------------------------------------------------------------------

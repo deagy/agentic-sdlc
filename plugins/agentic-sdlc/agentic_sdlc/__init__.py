@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,14 @@ GITLAB_MR_URI = re.compile(
 # where the intent/requirements content came from, not who signed off on it.
 GITLAB_ISSUE_URI = re.compile(
     r"^gitlab-issue:(?P<project_path>[A-Za-z0-9_./-]+):issues/(?P<iid>\d+)$"
+)
+# GitHub issue linkage for G1 Intent / G2 Requirements Baseline -- the GitHub
+# counterpart to GITLAB_ISSUE_URI above, same rationale: deliberately NOT an
+# approval-evidence adapter (no "approver" concept in the URI), never marks a
+# gate approved, and gate approval is unaffected by whether a source is
+# linked. See record_source_issue_link's docstring for the shared behavior.
+GITHUB_ISSUE_URI = re.compile(
+    r"^github-issue:(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+):issues/(?P<number>\d+)$"
 )
 
 
@@ -517,6 +526,13 @@ def parse_gitlab_issue_uri(value: str) -> dict[str, str] | None:
     return match.groupdict()
 
 
+def parse_github_issue_uri(value: str) -> dict[str, str] | None:
+    match = GITHUB_ISSUE_URI.fullmatch(value)
+    if not match:
+        return None
+    return match.groupdict()
+
+
 def fetch_gitlab_issue(project_path: str, issue_iid: int) -> dict[str, Any]:
     """Fetch a single GitLab issue's linkable fields. No author/assignee
     identity is ever read here -- an issue link has no approver concept
@@ -550,6 +566,46 @@ def fetch_gitlab_issue(project_path: str, issue_iid: int) -> dict[str, Any]:
         "title": title,
         "state": state,
         "web_url": raw_response.get("web_url"),
+        "updated_at": raw_response.get("updated_at"),
+    }
+
+
+def fetch_github_issue(repo: str, issue_number: int) -> dict[str, Any]:
+    """Fetch a single GitHub issue's linkable fields. No author/assignee
+    identity is ever read here -- an issue link has no approver concept
+    (unlike the PR review approval adapter), so there is nothing to minimize
+    away; only the fields needed to identify and reference the issue are
+    kept. GitHub's issue API uses "open"/"closed" (not GitLab's "opened") for
+    state and "html_url" (not "web_url") for the browser link -- both are
+    normalized into the same shape fetch_gitlab_issue returns so the shared
+    linking code downstream (record_source_issue_link) is forge-agnostic."""
+    mock_path = os.environ.get("AGENTIC_SDLC_TEST_GITHUB_ISSUE_FILE")
+    if mock_path:
+        raw_response = json.loads(Path(mock_path).read_text(encoding="utf-8"))
+    else:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/issues/{issue_number}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown gh api failure"
+            raise ValueError(f"unable to fetch GitHub issue for {repo} issue {issue_number}: {detail}")
+        raw_response = json.loads(result.stdout)
+    if not isinstance(raw_response, dict):
+        raise ValueError("GitHub issue API response must be a JSON object")
+    title = raw_response.get("title")
+    state = raw_response.get("state")
+    if not isinstance(title, str) or not title:
+        raise ValueError(f"GitHub issue {repo}#{issue_number} response is missing a title")
+    if state not in {"open", "closed"}:
+        raise ValueError(f"GitHub issue {repo}#{issue_number} response has an unrecognized state: {state!r}")
+    return {
+        "iid": issue_number,
+        "title": title,
+        "state": state,
+        "web_url": raw_response.get("html_url"),
         "updated_at": raw_response.get("updated_at"),
     }
 
@@ -914,23 +970,32 @@ def record_gate_decision(
 RECORD_FIELD_BY_GATE = {"G1": "intent_record_id", "G2": "requirements_baseline_id"}
 
 
-def record_gitlab_issue_link(
+def record_source_issue_link(
     root: Path,
     task_id: str,
     gate_id: str,
     authority_role: str,
-    project_path: str,
+    issue_uri: str,
     issue: dict[str, Any],
+    *,
+    parse_uri: Callable[[str], dict[str, str] | None],
+    source_label: str,
+    evidence_id_infix: str,
+    evidence_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Link a GitLab issue as the recorded source for a G1/G2 gate's
-    contribution. Deliberately does not touch human_approvals or gate
-    status -- a source link is not an approval; see GITLAB_ISSUE_URI's
-    module-level comment. Authorization mirrors the approval adapters
-    (only an assigned, applicable authority for the gate may attach a
-    link), but nothing here can mark a gate approved."""
+    """Shared implementation behind record_gitlab_issue_link and
+    record_github_issue_link: link a forge issue as the recorded source for
+    a G1/G2 gate's contribution. Deliberately does not touch human_approvals
+    or gate status -- a source link is not an approval; see
+    GITLAB_ISSUE_URI/GITHUB_ISSUE_URI's module-level comments. Authorization
+    mirrors the approval adapters (only an assigned, applicable authority
+    for the gate may attach a link), but nothing here can mark a gate
+    approved. Every check and mutation below is identical for both forges;
+    only the URI scheme/shape, error wording, and evidence payload differ,
+    which is why those are the only parameters callers vary."""
     record_field = RECORD_FIELD_BY_GATE.get(gate_id)
     if record_field is None:
-        raise ValueError(f"gate {gate_id} does not accept a GitLab issue source link")
+        raise ValueError(f"gate {gate_id} does not accept a {source_label} source link")
     _, project, authorities, _, _ = load_overlay(root)
     path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
     record = load_json(path)
@@ -947,23 +1012,11 @@ def record_gitlab_issue_link(
         raise ValueError(f"{gate_id} authority role {authority_role} is not applicable")
     if authority.get("status") != "assigned" or not authority.get("assignee"):
         raise ValueError(f"authority {authority_role} is not assigned")
-    issue_iid = issue["iid"]
-    issue_uri = f"gitlab-issue:{project_path}:issues/{issue_iid}"
-    if parse_gitlab_issue_uri(issue_uri) is None:
-        raise ValueError(f"invalid GitLab issue URI components for {issue_uri}")
-    evidence_payload = {
-        "task_id": task_id,
-        "gate_id": gate_id,
-        "authority_id": authority_role,
-        "project_path": project_path,
-        "issue_iid": issue_iid,
-        "title": issue["title"],
-        "state": issue["state"],
-        "web_url": issue.get("web_url"),
-    }
-    evidence_id_prefix = f"{gate_id.lower()}-source-gitlab-issue-"
+    if parse_uri(issue_uri) is None:
+        raise ValueError(f"invalid {source_label} URI components for {issue_uri}")
+    evidence_id_prefix = f"{gate_id.lower()}-source-{evidence_id_infix}-"
     evidence_entry = {
-        "evidence_id": f"{evidence_id_prefix}{issue_iid}",
+        "evidence_id": f"{evidence_id_prefix}{issue['iid']}",
         "uri": issue_uri,
         "hash_algorithm": "sha256",
         "hash": fingerprint(evidence_payload).removeprefix("sha256:"),
@@ -989,6 +1042,69 @@ def record_gitlab_issue_link(
         "issue_title": issue["title"],
         "issue_state": issue["state"],
     }
+
+
+def record_gitlab_issue_link(
+    root: Path,
+    task_id: str,
+    gate_id: str,
+    authority_role: str,
+    project_path: str,
+    issue: dict[str, Any],
+) -> dict[str, Any]:
+    """Link a GitLab issue as the recorded source for a G1/G2 gate's
+    contribution. See record_source_issue_link's docstring for the full
+    behavioral contract this delegates to."""
+    issue_uri = f"gitlab-issue:{project_path}:issues/{issue['iid']}"
+    evidence_payload = {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "project_path": project_path,
+        "issue_iid": issue["iid"],
+        "title": issue["title"],
+        "state": issue["state"],
+        "web_url": issue.get("web_url"),
+    }
+    return record_source_issue_link(
+        root, task_id, gate_id, authority_role, issue_uri, issue,
+        parse_uri=parse_gitlab_issue_uri,
+        source_label="GitLab issue",
+        evidence_id_infix="gitlab-issue",
+        evidence_payload=evidence_payload,
+    )
+
+
+def record_github_issue_link(
+    root: Path,
+    task_id: str,
+    gate_id: str,
+    authority_role: str,
+    repo: str,
+    issue: dict[str, Any],
+) -> dict[str, Any]:
+    """Link a GitHub issue as the recorded source for a G1/G2 gate's
+    contribution -- the GitHub counterpart to record_gitlab_issue_link. See
+    record_source_issue_link's docstring for the full behavioral contract
+    this delegates to."""
+    issue_uri = f"github-issue:{repo}:issues/{issue['iid']}"
+    evidence_payload = {
+        "task_id": task_id,
+        "gate_id": gate_id,
+        "authority_id": authority_role,
+        "repo": repo,
+        "issue_number": issue["iid"],
+        "title": issue["title"],
+        "state": issue["state"],
+        "web_url": issue.get("web_url"),
+    }
+    return record_source_issue_link(
+        root, task_id, gate_id, authority_role, issue_uri, issue,
+        parse_uri=parse_github_issue_uri,
+        source_label="GitHub issue",
+        evidence_id_infix="github-issue",
+        evidence_payload=evidence_payload,
+    )
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -1901,6 +2017,8 @@ def validate_repository(args: argparse.Namespace) -> int:
                 uri = evidence.get("uri")
                 if isinstance(uri, str) and uri.startswith("gitlab-issue:") and parse_gitlab_issue_uri(uri) is None:
                     errors.append(f"{record_path}: {gate_id} has an invalid GitLab issue URI")
+                if isinstance(uri, str) and uri.startswith("github-issue:") and parse_github_issue_uri(uri) is None:
+                    errors.append(f"{record_path}: {gate_id} has an invalid GitHub issue URI")
             contract = gate_contracts.get(gate_id, {})
             execution = execution_gates.get(gate_id)
             if execution is None:
@@ -2210,15 +2328,61 @@ def validate_repository(args: argparse.Namespace) -> int:
     return 2 if blockers else 0
 
 
+def gate_status_projection(root: Path, task_id: str) -> dict[str, Any]:
+    """Pure, read-only projection of a task's lifecycle-gate state: loads
+    `run-record.json`, calls `advance_lifecycle()` against an IN-MEMORY copy
+    only, and returns the projected fields below -- it NEVER writes
+    `run-record.json` (or anything else) back to disk. This is the sole
+    entry point `gate_status.py` (`publish-gate-status`/`list-gate-status`)
+    is allowed to use to read task state; that module must never open
+    `run-record.json` directly, so every field it could possibly render is
+    exactly what is projected here.
+
+    `status()` below is refactored to call this for its own printed summary
+    (see that function for why it does not simply reuse this return value
+    for its persisted write: it needs the *full* mutated record, not the
+    minimal projection, so it performs its own equivalent, deterministic
+    load + `advance_lifecycle()` + `write_json()` sequence separately;
+    `advance_lifecycle()` is a pure function of `(record, routing)` and
+    neither call writes to disk before the other reads, so both computations
+    agree)."""
+    root = Path(root)
+    record = load_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"))
+    routing = load_overlay(root)[4]
+    advance_lifecycle(record, routing)  # in-memory only; caller must never persist `record` from here
+    gates = [
+        {
+            "gate_id": gate["gate_id"],
+            "status": gate["status"],
+            "applicability": gate["applicability"],
+            "required_reentry_gate": gate.get("required_reentry_gate"),
+        }
+        for gate in record["lifecycle_gates"]
+    ]
+    return {
+        "task_id": task_id,
+        "current_phase": derive_current_phase(record),
+        "gates": gates,
+        "re_entry_history": record["re_entry_history"],
+        "classification": record.get("classification"),
+    }
+
+
 def status(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     task_id = safe_task_id(args.task_id)
-    record = load_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"))
+    projection = gate_status_projection(root, task_id)
+    record_path = confined_path(root, OVERLAY, "runs", task_id, "run-record.json")
+    record = load_json(record_path)
     routing = load_overlay(root)[4]
     advance_lifecycle(record, routing)
-    write_json(confined_path(root, OVERLAY, "runs", task_id, "run-record.json"), record)
-    gates = [{"gate_id": gate["gate_id"], "status": gate["status"], "applicability": gate["applicability"], "required_reentry_gate": gate.get("required_reentry_gate")} for gate in record["lifecycle_gates"]]
-    print(json.dumps({"task_id": task_id, "current_phase": derive_current_phase(record), "gates": gates, "re_entry_history": record["re_entry_history"]}, indent=2))
+    write_json(record_path, record)
+    print(json.dumps({
+        "task_id": task_id,
+        "current_phase": projection["current_phase"],
+        "gates": projection["gates"],
+        "re_entry_history": projection["re_entry_history"],
+    }, indent=2))
     return 0
 
 
@@ -2460,6 +2624,24 @@ def link_requirements_from_gitlab_issue(args: argparse.Namespace) -> int:
     return 0
 
 
+def link_intent_from_github_issue(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    issue = fetch_github_issue(args.repo, args.issue_number)
+    result = record_github_issue_link(root, task_id, "G1", args.role, args.repo, issue)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def link_requirements_from_github_issue(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    issue = fetch_github_issue(args.repo, args.issue_number)
+    result = record_github_issue_link(root, task_id, "G2", args.role, args.repo, issue)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_create_gate_issues(args: argparse.Namespace) -> int:
     """Publish gate/approval GitLab tracking issues for a task's lifecycle
     gates (`agentic_sdlc/gate_issues.py`). Strictly orthogonal to the
@@ -2502,6 +2684,68 @@ def cmd_list_gate_issues(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     task_id = safe_task_id(args.task_id)
     print(json.dumps(gate_issues.read_ledger(root, task_id), indent=2))
+    return 0
+
+
+def cmd_publish_gate_status(args: argparse.Namespace) -> int:
+    """Publish/update a one-way, read-only gate-status summary comment on a
+    task's GitHub PR or GitLab MR (`agentic_sdlc/gate_status.py`)."""
+    from . import gate_status  # local import: see gate_status.py's own docstring for why
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    try:
+        result = gate_status.run(
+            root=root,
+            task_id=task_id,
+            forge=args.forge,
+            repo=args.repo,
+            pr=args.pr,
+            project_path=args.project_path,
+            mr_iid=args.mr_iid,
+            as_bot=args.as_bot,
+            allow_classification=args.allow_classification,
+            apply=args.apply,
+            break_lock=args.break_lock,
+            i_know_this_is_mocked=args.i_know_this_is_mocked,
+        )
+    except gate_status.GateStatusBlocked as error:
+        print(json.dumps({"error": str(error)}, indent=2), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_list_gate_status(args: argparse.Namespace) -> int:
+    from . import gate_status  # local import: see gate_status.py's own docstring for why
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    print(json.dumps(gate_status.list_ledgers(root, task_id), indent=2))
+    return 0
+
+
+def cmd_request_gate_reviewers(args: argparse.Namespace) -> int:
+    """Read-only report -- see gate_reviewers.py's module docstring. There
+    is no `--apply` and no write call anywhere in this code path."""
+    from . import gate_reviewers  # local import: mirrors gate_issues.py's own local-import convention
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    gates = [item.strip() for item in args.gates.split(",") if item.strip()] if args.gates else None
+    result = gate_reviewers.run(
+        root=root,
+        task_id=task_id,
+        repo=args.repo,
+        pr=args.pr,
+        as_bot=args.as_bot,
+        gates=gates,
+        allow_classification=args.allow_classification,
+    )
+    print(json.dumps(result, indent=2))
+    has_problem = any(item["classification"] in gate_reviewers.PROBLEM_CLASSIFICATIONS for item in result["reviewers"])
+    if result.get("refusals") or has_problem:
+        return 2
     return 0
 
 
@@ -2616,6 +2860,20 @@ def build_parser() -> argparse.ArgumentParser:
     link_requirements.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
     link_requirements.add_argument("--issue-iid", type=int, required=True, help="Issue internal ID (iid)")
     link_requirements.set_defaults(handler=link_requirements_from_gitlab_issue)
+    link_intent_github = subparsers.add_parser("link-intent-from-github-issue", help="Link a GitHub issue as the recorded source for G1 Intent")
+    link_intent_github.add_argument("--root", default=".")
+    link_intent_github.add_argument("--task-id", required=True)
+    link_intent_github.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True, help="Authority role recording the link")
+    link_intent_github.add_argument("--repo", required=True, help="GitHub repository in owner/name form")
+    link_intent_github.add_argument("--issue-number", type=int, required=True, help="Issue number")
+    link_intent_github.set_defaults(handler=link_intent_from_github_issue)
+    link_requirements_github = subparsers.add_parser("link-requirements-from-github-issue", help="Link a GitHub issue as the recorded source for G2 Requirements Baseline")
+    link_requirements_github.add_argument("--root", default=".")
+    link_requirements_github.add_argument("--task-id", required=True)
+    link_requirements_github.add_argument("--role", choices=sorted(AUTHORITY_ROLES), required=True, help="Authority role recording the link")
+    link_requirements_github.add_argument("--repo", required=True, help="GitHub repository in owner/name form")
+    link_requirements_github.add_argument("--issue-number", type=int, required=True, help="Issue number")
+    link_requirements_github.set_defaults(handler=link_requirements_from_github_issue)
     create_gate_issues = subparsers.add_parser(
         "create-gate-issues", help="Publish GitLab gate/approval tracking issues for a task's lifecycle gates"
     )
@@ -2658,6 +2916,62 @@ def build_parser() -> argparse.ArgumentParser:
     list_gate_issues.add_argument("--root", default=".")
     list_gate_issues.add_argument("--task-id", required=True)
     list_gate_issues.set_defaults(handler=cmd_list_gate_issues)
+    publish_gate_status = subparsers.add_parser(
+        "publish-gate-status",
+        help="Post or update a one-way, read-only gate-status summary comment on a task's GitHub PR or GitLab MR",
+    )
+    publish_gate_status.add_argument("--root", default=".")
+    publish_gate_status.add_argument("--task-id", required=True)
+    publish_gate_status.add_argument("--forge", choices=["github", "gitlab"], required=True, help="Never inferred")
+    publish_gate_status.add_argument("--repo", default=None, help="GitHub repository in owner/name form; required iff --forge github")
+    publish_gate_status.add_argument("--pr", type=int, default=None, help="Pull request number; required iff --forge github")
+    publish_gate_status.add_argument("--project-path", default=None, help="GitLab project path (namespace/project); required iff --forge gitlab")
+    publish_gate_status.add_argument("--mr-iid", type=int, default=None, help="Merge request internal ID (iid); required iff --forge gitlab")
+    publish_gate_status.add_argument(
+        "--as-bot", required=True, help="Required bot/machine username; verified via `gh api user` / `glab api user`"
+    )
+    publish_gate_status.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's run-record classification -- no default",
+    )
+    gate_status_mode = publish_gate_status.add_mutually_exclusive_group()
+    gate_status_mode.add_argument("--dry-run", dest="apply", action="store_false", help="Default: print the body and resolved action only")
+    gate_status_mode.add_argument("--apply", dest="apply", action="store_true", help="Actually create/update the comment")
+    publish_gate_status.set_defaults(apply=False)
+    publish_gate_status.add_argument("--break-lock", action="store_true", help="Explicitly override a held lock file")
+    publish_gate_status.add_argument(
+        "--i-know-this-is-mocked", action="store_true",
+        help="Required alongside --apply whenever a mock backend env var is set",
+    )
+    publish_gate_status.set_defaults(handler=cmd_publish_gate_status)
+    list_gate_status = subparsers.add_parser(
+        "list-gate-status", help="Print the gate-status sidecar ledger(s) for a task (both forges, zero network)"
+    )
+    list_gate_status.add_argument("--root", default=".")
+    list_gate_status.add_argument("--task-id", required=True)
+    list_gate_status.set_defaults(handler=cmd_list_gate_status)
+    request_gate_reviewers = subparsers.add_parser(
+        "request-gate-reviewers",
+        help=(
+            "Report which GitHub logins would be requested as PR reviewers for a task's lifecycle gates "
+            "-- read-only/reporting only in this version, never posts a review request"
+        ),
+    )
+    request_gate_reviewers.add_argument("--root", default=".")
+    request_gate_reviewers.add_argument("--task-id", required=True)
+    request_gate_reviewers.add_argument("--repo", required=True, help="GitHub repository in owner/name form")
+    request_gate_reviewers.add_argument("--pr", type=int, required=True, help="Pull request number; never auto-discovered")
+    request_gate_reviewers.add_argument(
+        "--as-bot", required=True, help="Required GitHub bot/machine login; verified via `gh api user`"
+    )
+    request_gate_reviewers.add_argument(
+        "--gates", default=None, help="Comma-separated gate ids, e.g. G1,G3,G9; default = all eligible gates"
+    )
+    request_gate_reviewers.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's run-record classification -- no default",
+    )
+    request_gate_reviewers.set_defaults(handler=cmd_request_gate_reviewers)
     decide = subparsers.add_parser("decide", help="Record a human decision (approved/rejected/request-changes) for a lifecycle gate")
     decide.add_argument("--root", default=".")
     decide.add_argument("--task-id", required=True)

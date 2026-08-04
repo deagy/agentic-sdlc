@@ -143,8 +143,13 @@ approve-from-gitlab  Record a human lifecycle approval from a GitLab MR approval
 approve-from-gitlab-mr  Fetch an approved GitLab MR approval and record it as lifecycle approval evidence. Speculative: not the approval source this kernel's own default provider uses (see "Current limitations").
 link-intent-from-gitlab-issue  Link a GitLab issue as the recorded source for G1 Intent.
 link-requirements-from-gitlab-issue  Link a GitLab issue as the recorded source for G2 Requirements Baseline.
+link-intent-from-github-issue  Link a GitHub issue as the recorded source for G1 Intent.
+link-requirements-from-github-issue  Link a GitHub issue as the recorded source for G2 Requirements Baseline.
 create-gate-issues  Publish GitLab gate/approval tracking issues for a task's lifecycle gates.
 list-gate-issues   Print the gate-issues sidecar ledger for a task.
+publish-gate-status  Post or update a one-way, read-only gate-status summary comment on a task's GitHub PR or GitLab MR.
+list-gate-status   Print the gate-status sidecar ledger(s) for a task (both forges, zero network).
+request-gate-reviewers  Report GitHub PR reviewer candidates for a task's lifecycle gates. Read-only / reporting only in this version -- see "Reporting GitHub PR reviewer candidates" below.
 invalidate  Record a material change and invalidate the earliest affected gate and its dependents.
 ```
 
@@ -206,6 +211,17 @@ Each command fetches the issue via `glab api projects/<project>/issues/<iid>`, r
 
 Unlike the approval adapters, no per-person identity is ever fetched or persisted here — an issue link has no "approver" concept, so there is nothing to data-minimize away. Only the issue's `iid`, `title`, `state`, and `web_url` are used.
 
+### Linking a GitHub issue as an intent/requirements source
+
+`link-intent-from-github-issue` and `link-requirements-from-github-issue` are the GitHub counterpart to the GitLab issue-linking commands above, with identical behavior and the same `intent_record_id`/`requirements_baseline_id` run-record fields — only the forge, URI scheme, and flags differ.
+
+```sh
+agentic-sdlc link-intent-from-github-issue --root /path/to/target --task-id TEAM-DEMO-001 --role product_owner --repo owner/project --issue-number 42
+agentic-sdlc link-requirements-from-github-issue --root /path/to/target --task-id TEAM-DEMO-001 --role engineering_lead --repo owner/project --issue-number 42
+```
+
+Each command fetches the issue via `gh api repos/<owner>/<repo>/issues/<issue-number>`, records it as gate-level evidence in the form `github-issue:<owner>/<repo>:issues/<issue-number>`, and sets the corresponding run-record field to that URI. The same replace-on-relink, `invalidate`/`reenter` clearing, and "deliberately not approval evidence" properties described above apply unchanged — linking a GitHub issue never marks G1/G2 approved, and gate approval is unaffected by whether a source is linked. As with the GitLab adapter, no per-person identity is ever fetched or persisted; only the issue's number, `title`, `state`, and `html_url` (as `web_url`) are used.
+
 ### Publishing GitLab gate/approval tracking issues
 
 `create-gate-issues` backs a task's lifecycle gates with real GitLab issues, idempotently: one **gate tracking issue** per applicable, in-sequence lifecycle gate, plus one **approval issue** per applicable `authority_requirements[]` entry, assigned to the resolved GitLab username (`authority_gitlab_username()` — same identity binding `approve-from-gitlab-mr` uses). GitLab itself (queried by a deterministic, non-sensitive label pair) is the source of truth for "does this issue already exist"; a local sidecar ledger (`.agentic-sdlc/runs/<task-id>/gate-issues.json`) is diagnostics only and is never trusted over a fresh label search. This is strictly outbound-only and orthogonal to the approval adapters above: it never writes `human_approvals`, `gate.status`, `evidence_refs`, or `disposition` — closing a tracking issue on GitLab is never approval evidence.
@@ -219,6 +235,37 @@ agentic-sdlc create-gate-issues --root /path/to/target --task-id TEAM-DEMO-001 -
 agentic-sdlc create-gate-issues --root /path/to/target --task-id TEAM-DEMO-001 --project-path group/project --as-bot svc-agentic-sdlc --allow-classification internal --apply --plan-digest sha256:...
 agentic-sdlc list-gate-issues --root /path/to/target --task-id TEAM-DEMO-001
 ```
+
+### Publishing a one-way gate-status summary comment
+
+`publish-gate-status` posts (and idempotently updates in place on re-run) a single **read-only, diagnostics-only** comment summarizing all ten lifecycle gates' status on a task's GitHub PR or GitLab MR, so reviewers can see gate state without leaving the PR/MR. **This is never approval evidence and is never read back**: the rendered comment says so explicitly, `agentic-sdlc` never reads the comment, its reactions, or its replies into gate state, and there is no adapter that could turn a reaction or reply into an approval. Gate approval remains exclusively `agentic-sdlc decide` / `approve-from-gitlab-mr` / `approve-from-github-pr`, against an external approval record.
+
+Content comes from exactly two sources: a pure, read-only projection of the run record (`gate_status_projection()` — the same function `status` uses for its own printed summary, refactored out specifically so this command can share it without ever writing `run-record.json`) and the bundled lifecycle-gate contract (gate names, `human_only`). `authorities.json` is never opened, `evidence_refs`/`applicability_rationale`/`scope`/`findings`/`specialist_attestations`/`disposition` and any human identity field are never read, and `re_entry_history` is reduced to a count plus the earliest re-entered gate id only — no free-text or identity field from the run record can ever reach the rendered comment.
+
+`--forge {github,gitlab}` is required and never inferred; supply `--repo`/`--pr` for GitHub or `--project-path`/`--mr-iid` for GitLab (the wrong pair for the selected forge fails immediately). Matching an existing comment is by a domain-separated marker embedded in an HTML comment (`<!-- agentic-sdlc:gate-status:v1:<marker> -->`, matched on the marker only, never the version segment, so a future template version still finds and updates today's comment instead of duplicating it) — up to 1,000 comments/notes are scanned; exceeding that cap fails closed (exit 2) rather than risk missing a match on a later page. Zero matches creates a new comment; one match authored by the verified `--as-bot` identity updates it in place (or reports `unchanged` with no write at all if the freshly rendered body matches the existing comment once the live `rendered {timestamp}` token is excluded from the comparison — that token changes on every invocation by design and must never by itself force an `update`); more than one match, or a match authored by anyone else, is refused (exit 2) rather than silently reused or overwritten. Every create/update is re-fetched and verified (id, author, byte-identical body — this post-write check is an exact comparison, unlike the unchanged/update classification above) before being trusted; a mismatch is recorded as `suspect` in the local sidecar ledger and blocks (exit 2).
+
+`--dry-run` (the default) always lists existing comments and verifies `--as-bot` identity — both read-only forge calls needed to report an accurate `create`/`update`/`unchanged`/`blocked` action — but never writes; only `--apply` can actually create or update the comment. Unlike `create-gate-issues`, there is no `--plan-digest` two-phase handshake: re-running to keep the comment current is the intended workflow, and there is no identity/assignment confirmation that would need binding across dry-run and apply.
+
+```sh
+agentic-sdlc publish-gate-status --root /path/to/target --task-id TEAM-DEMO-001 --forge github --repo owner/project --pr 42 --as-bot svc-agentic-sdlc --allow-classification internal --dry-run
+agentic-sdlc publish-gate-status --root /path/to/target --task-id TEAM-DEMO-001 --forge github --repo owner/project --pr 42 --as-bot svc-agentic-sdlc --allow-classification internal --apply
+agentic-sdlc publish-gate-status --root /path/to/target --task-id TEAM-DEMO-001 --forge gitlab --project-path group/project --mr-iid 7 --as-bot svc-agentic-sdlc --allow-classification internal --apply
+agentic-sdlc list-gate-status --root /path/to/target --task-id TEAM-DEMO-001
+```
+
+The local sidecar ledger (`.agentic-sdlc/runs/<task-id>/gate-status-<forge>.json`) is diagnostics only, exactly like `create-gate-issues`'s ledger — a fresh scan of the PR/MR's live comments for the marker is always the source of truth for "does this comment already exist," never the ledger. `list-gate-status` takes no `--forge` flag and reports both forges' ledgers (empty for a forge never published to), since a task's lifecycle could in principle be tracked on either or both over its life.
+
+### Reporting GitHub PR reviewer candidates (read-only / reporting only in this version)
+
+`request-gate-reviewers` reports which GitHub logins *would* be requested as PR reviewers for a task's lifecycle gates, derived from each eligible gate's `authority_requirements[]` and `authorities.json`, and classifies each candidate against the PR's live state: already requested, already reviewed (at the current head commit), review is stale (approved an older commit), or still to-request. **This version never posts a review request. There is no `--apply` flag and no write call anywhere in this code path.** Requesting PR reviewers requires a GitHub token with `Pull requests: write` scope, which has no narrower equivalent and also permits editing/closing PRs and changing labels — introducing that write capability is a real permission-escalation decision that needs explicit human sign-off before it is built, not something inferred from this feature's name. This read-only version needs no GitHub permissions beyond what the kernel already used for `approve-from-github-pr` (read-only PR/reviews access).
+
+Multiple `(gate, authority)` pairs that resolve to the same GitHub login collapse into one reviewer entry carrying every motivating gate/authority/role. Because a GitHub review request is PR-wide (not gate-scoped), if *any* in-scope pair refuses a login for an independence reason (`self-approval`, `pr-author-conflict` — the login is the PR's author, or `actor-is-reviewer` — the login is the verified `--as-bot` identity), that login is withheld from every one of its motivations, not just the conflicting one, and reported as `withheld-conflict` with a pointer to the gate that caused it. Resolution failures (no GitHub login bound, the login doesn't resolve to a real GitHub user, or the login isn't a repository collaborator) do not have this PR-wide poisoning effect.
+
+```sh
+agentic-sdlc request-gate-reviewers --root /path/to/target --task-id TEAM-DEMO-001 --repo owner/project --pr 42 --as-bot svc-agentic-sdlc --allow-classification internal
+```
+
+There is no `list-gate-reviewer-requests` companion command and no local ledger: unlike `create-gate-issues`, this command performs no action, so nothing needs to be remembered between runs — a fresh invocation is always at least as accurate as any cached report would be, since GitHub's review/requested-reviewer state can change between runs.
 
 `validate` exits with `0` when valid and ready, `2` when structurally valid but blocked by unresolved decisions, and `1` for errors. Treat both `1` and `2` as non-ready in CI.
 

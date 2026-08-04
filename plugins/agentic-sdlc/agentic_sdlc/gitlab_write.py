@@ -40,6 +40,13 @@ they mirror the issue-comment functions' shape. They operate on GitLab's MR
 above -- a merge request's notes are a materially different resource from a
 GitLab issue's, even though both are called "notes" in GitLab's own API
 terminology.
+
+`fetch_gitlab_mr` is a further, read-only-only extension for
+`request-gate-reviewers-gitlab` (`agentic_sdlc/gate_reviewers_gitlab.py`),
+reusing the same mock file with a new top-level `"mr"` key. It is the
+GitLab counterpart of `github_write.fetch_github_pr` -- a single
+`GET .../merge_requests/:iid` call, never a write -- and raises `MRNotFound`
+on a 404, mirroring `github_write.PRNotFound`.
 """
 
 from __future__ import annotations
@@ -558,3 +565,45 @@ def create_gitlab_issue_link(
             )
         raise ValueError(f"unable to create issue link for {project_path}#{source_iid}: {detail}")
     return _parse_glab_json(result.stdout, "create_gitlab_issue_link")
+
+
+class MRNotFound(ValueError):
+    """Raised by `fetch_gitlab_mr` on a 404. Mirrors `github_write.PRNotFound`
+    -- a distinct exception so `gate_reviewers_gitlab.run()` can attach
+    precise, structural error context rather than string-matching a generic
+    `ValueError`."""
+
+
+def _is_not_found_error(stderr_text: str) -> bool:
+    """`glab api` surfaces GitLab's HTTP status as plain text within its
+    error output rather than a structured field (same limitation documented
+    on `_is_link_unavailable_error` above), so detecting a 404 means looking
+    for it in `stderr`."""
+    return "404" in stderr_text or "Not Found" in stderr_text
+
+
+def fetch_gitlab_mr(project_path: str, mr_iid: int) -> dict[str, Any]:
+    """`GET projects/:id/merge_requests/:iid`. Raises `MRNotFound` on a 404.
+    Read-only counterpart of `github_write.fetch_github_pr`. Mock
+    convention: `mock["mr"]` is the raw MR response object, or absent/None
+    to simulate a 404."""
+    mock = _load_issue_create_mock()
+    if mock is not None:
+        raw = mock.get("mr")
+        if raw is None:
+            raise MRNotFound(f"mocked MR lookup for {project_path}!{mr_iid} is missing (simulated 404)")
+        if not isinstance(raw, dict):
+            raise ValueError("mocked mr response must be a JSON object")
+        return raw
+
+    encoded_project = quote(project_path, safe="")
+    result = _run_glab(["glab", "api", f"projects/{encoded_project}/merge_requests/{mr_iid}"])
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or "unknown glab api failure"
+        if _is_not_found_error(detail):
+            raise MRNotFound(f"GitLab MR {project_path}!{mr_iid} not found: {detail}")
+        raise ValueError(f"unable to fetch GitLab MR {project_path}!{mr_iid}: {detail}")
+    raw = _parse_glab_json(result.stdout, "fetch_gitlab_mr")
+    if not isinstance(raw, dict):
+        raise ValueError("GitLab MR response must be a JSON object")
+    return raw

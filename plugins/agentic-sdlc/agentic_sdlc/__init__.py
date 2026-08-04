@@ -336,8 +336,9 @@ def fetch_github_pr_reviews(repo: str, pr: int) -> list[dict[str, Any]]:
     if mock_path:
         payload = json.loads(Path(mock_path).read_text(encoding="utf-8"))
     else:
+        encoded_repo_parts = "/".join(quote(part, safe="") for part in repo.split("/", 1))
         result = subprocess.run(
-            ["gh", "api", f"repos/{repo}/pulls/{pr}/reviews"],
+            ["gh", "api", f"repos/{encoded_repo_parts}/pulls/{pr}/reviews"],
             text=True,
             capture_output=True,
             check=False,
@@ -608,6 +609,24 @@ def fetch_github_issue(repo: str, issue_number: int) -> dict[str, Any]:
         "web_url": raw_response.get("html_url"),
         "updated_at": raw_response.get("updated_at"),
     }
+
+
+def is_gate_self_approval(assignee_id: Any, gate_record: dict[str, Any]) -> bool:
+    """Pure run-record predicate: is `assignee_id` a preparer or the
+    independent verifier of `gate_record`? Shared by `gate_issues.py`
+    (gitlab tracking issues) and `gate_reviewers.py` (github reviewer
+    report) -- extracted here so both call one implementation instead of
+    maintaining duplicate copies. No forge coupling: takes/returns plain
+    data, never touches GitLab/GitHub.
+
+    Kernel-side, `preparers` is always `[]` and `independent_verifier` is
+    always `None` (`make_gate_record`), so this passes vacuously today --
+    implemented anyway since it becomes load-bearing once preparers are
+    populated by any other path."""
+    preparers = {item.get("id") for item in gate_record.get("preparers", []) if isinstance(item, dict)}
+    verifier = gate_record.get("independent_verifier")
+    verifier_id = verifier.get("id") if isinstance(verifier, dict) else None
+    return assignee_id in preparers or (verifier_id is not None and assignee_id == verifier_id)
 
 
 def human_requirement_for_gate(gate: dict[str, Any], authority_id: str) -> dict[str, Any] | None:
@@ -2687,6 +2706,50 @@ def cmd_list_gate_issues(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_create_github_gate_issues(args: argparse.Namespace) -> int:
+    """Publish gate/approval GitHub tracking issues for a task's lifecycle
+    gates (`agentic_sdlc/gate_issues_github.py`) -- the GitHub mirror of
+    `create-gate-issues`. Strictly orthogonal to the approval adapters, same
+    as `gate_issues.py`; see that module's docstring for the full reasoning."""
+    from . import gate_issues_github  # local import: mirrors gate_issues.py's own local-import convention
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    gates = [item.strip() for item in args.gates.split(",") if item.strip()] if args.gates else None
+    try:
+        result = gate_issues_github.run(
+            root=root,
+            task_id=task_id,
+            repo=args.repo,
+            as_bot=args.as_bot,
+            gates=gates,
+            apply=args.apply,
+            plan_digest=args.plan_digest,
+            allow_classification=args.allow_classification,
+            include_scope=args.include_scope,
+            reconcile_assignees=args.reconcile_assignees,
+            allow_public_repo=args.allow_public_repo,
+            break_lock=args.break_lock,
+            i_know_this_is_mocked=args.i_know_this_is_mocked,
+        )
+    except gate_issues_github.GateIssuesGithubBlocked as error:
+        print(json.dumps({"error": str(error)}, indent=2), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
+    if result.get("refusals") or result.get("drift_detected"):
+        return 2
+    return 0
+
+
+def cmd_list_github_gate_issues(args: argparse.Namespace) -> int:
+    from . import gate_issues_github  # local import: mirrors gate_issues.py's own local-import convention
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    print(json.dumps(gate_issues_github.read_ledger(root, task_id), indent=2))
+    return 0
+
+
 def cmd_publish_gate_status(args: argparse.Namespace) -> int:
     """Publish/update a one-way, read-only gate-status summary comment on a
     task's GitHub PR or GitLab MR (`agentic_sdlc/gate_status.py`)."""
@@ -2746,6 +2809,70 @@ def cmd_request_gate_reviewers(args: argparse.Namespace) -> int:
     has_problem = any(item["classification"] in gate_reviewers.PROBLEM_CLASSIFICATIONS for item in result["reviewers"])
     if result.get("refusals") or has_problem:
         return 2
+    return 0
+
+
+def cmd_request_gate_reviewers_gitlab(args: argparse.Namespace) -> int:
+    """Read-only report -- see gate_reviewers_gitlab.py's module docstring.
+    There is no `--apply` and no write call anywhere in this code path."""
+    from . import gate_reviewers_gitlab  # local import: mirrors gate_issues.py's own local-import convention
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    gates = [item.strip() for item in args.gates.split(",") if item.strip()] if args.gates else None
+    result = gate_reviewers_gitlab.run(
+        root=root,
+        task_id=task_id,
+        project_path=args.project_path,
+        mr_iid=args.mr_iid,
+        as_bot=args.as_bot,
+        gates=gates,
+        allow_classification=args.allow_classification,
+    )
+    print(json.dumps(result, indent=2))
+    has_problem = any(
+        item["classification"] in gate_reviewers_gitlab.PROBLEM_CLASSIFICATIONS for item in result["reviewers"]
+    )
+    if result.get("refusals") or has_problem:
+        return 2
+    return 0
+
+
+def cmd_publish_reviewer_nudge(args: argparse.Namespace) -> int:
+    """Publish/update an advisory, GitHub-only reviewer-nudge comment
+    (`agentic_sdlc/reviewer_nudge.py`) -- never a review request, see that
+    module's own docstring."""
+    from . import reviewer_nudge  # local import: mirrors gate_status.py's own local-import convention
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    gates = [item.strip() for item in args.gates.split(",") if item.strip()] if args.gates else None
+    try:
+        result = reviewer_nudge.run(
+            root=root,
+            task_id=task_id,
+            repo=args.repo,
+            pr=args.pr,
+            as_bot=args.as_bot,
+            gates=gates,
+            allow_classification=args.allow_classification,
+            apply=args.apply,
+            break_lock=args.break_lock,
+            i_know_this_is_mocked=args.i_know_this_is_mocked,
+        )
+    except reviewer_nudge.ReviewerNudgeBlocked as error:
+        print(json.dumps({"error": str(error)}, indent=2), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_list_reviewer_nudge(args: argparse.Namespace) -> int:
+    from . import reviewer_nudge  # local import: mirrors gate_status.py's own local-import convention
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    print(json.dumps(reviewer_nudge.read_ledger(root, task_id), indent=2))
     return 0
 
 
@@ -2916,6 +3043,52 @@ def build_parser() -> argparse.ArgumentParser:
     list_gate_issues.add_argument("--root", default=".")
     list_gate_issues.add_argument("--task-id", required=True)
     list_gate_issues.set_defaults(handler=cmd_list_gate_issues)
+    create_github_gate_issues = subparsers.add_parser(
+        "create-github-gate-issues", help="Publish GitHub gate/approval tracking issues for a task's lifecycle gates"
+    )
+    create_github_gate_issues.add_argument("--root", default=".")
+    create_github_gate_issues.add_argument("--task-id", required=True)
+    create_github_gate_issues.add_argument("--repo", required=True, help="GitHub repository (owner/name)")
+    create_github_gate_issues.add_argument(
+        "--as-bot", required=True, help="Required GitHub bot/machine login; verified via `gh api user`"
+    )
+    create_github_gate_issues.add_argument(
+        "--gates", default=None, help="Comma-separated gate ids, e.g. G1,G3,G9; default = all eligible gates"
+    )
+    gate_issues_github_mode = create_github_gate_issues.add_mutually_exclusive_group()
+    gate_issues_github_mode.add_argument("--dry-run", dest="apply", action="store_false", help="Default: print the plan digest only")
+    gate_issues_github_mode.add_argument("--apply", dest="apply", action="store_true", help="Actually create/reuse issues")
+    create_github_gate_issues.set_defaults(apply=False)
+    create_github_gate_issues.add_argument("--plan-digest", default=None, help="Required with --apply (from a prior --dry-run)")
+    create_github_gate_issues.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's run-record classification -- no default",
+    )
+    create_github_gate_issues.add_argument(
+        "--include-scope", action="store_true", help="Add a sanitized scope line to gate issue descriptions (default off)"
+    )
+    create_github_gate_issues.add_argument(
+        "--reconcile-assignees", action="store_true",
+        help="Overwrite GitHub's assignee to match authorities.json on drift (default: report only)",
+    )
+    create_github_gate_issues.add_argument(
+        "--allow-public-repo", action="store_true",
+        help="Required to proceed if the target repository is public (GitHub issues have no per-issue "
+        "confidential flag; see gate_issues_github.py)",
+    )
+    create_github_gate_issues.add_argument("--break-lock", action="store_true", help="Explicitly override a held lock file")
+    create_github_gate_issues.add_argument(
+        "--i-know-this-is-mocked", action="store_true",
+        help="Required alongside --apply whenever AGENTIC_SDLC_TEST_GITHUB_READ_FILE or "
+        "AGENTIC_SDLC_TEST_GITHUB_ISSUE_FILE is set",
+    )
+    create_github_gate_issues.set_defaults(handler=cmd_create_github_gate_issues)
+    list_github_gate_issues = subparsers.add_parser(
+        "list-github-gate-issues", help="Print the GitHub gate-issues sidecar ledger for a task"
+    )
+    list_github_gate_issues.add_argument("--root", default=".")
+    list_github_gate_issues.add_argument("--task-id", required=True)
+    list_github_gate_issues.set_defaults(handler=cmd_list_github_gate_issues)
     publish_gate_status = subparsers.add_parser(
         "publish-gate-status",
         help="Post or update a one-way, read-only gate-status summary comment on a task's GitHub PR or GitLab MR",
@@ -2972,6 +3145,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Must exactly match the task's run-record classification -- no default",
     )
     request_gate_reviewers.set_defaults(handler=cmd_request_gate_reviewers)
+    request_gate_reviewers_gitlab = subparsers.add_parser(
+        "request-gate-reviewers-gitlab",
+        help=(
+            "Report which GitLab usernames would be set as MR reviewers for a task's lifecycle gates "
+            "-- read-only/reporting only, never sets reviewer_ids"
+        ),
+    )
+    request_gate_reviewers_gitlab.add_argument("--root", default=".")
+    request_gate_reviewers_gitlab.add_argument("--task-id", required=True)
+    request_gate_reviewers_gitlab.add_argument(
+        "--project-path", required=True, help="GitLab project path (namespace/project)"
+    )
+    request_gate_reviewers_gitlab.add_argument(
+        "--mr-iid", type=int, required=True, help="Merge request internal ID (iid); never auto-discovered"
+    )
+    request_gate_reviewers_gitlab.add_argument(
+        "--as-bot", required=True, help="Required GitLab bot/machine username; verified via `glab api user`"
+    )
+    request_gate_reviewers_gitlab.add_argument(
+        "--gates", default=None, help="Comma-separated gate ids, e.g. G1,G3,G9; default = all eligible gates"
+    )
+    request_gate_reviewers_gitlab.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's run-record classification -- no default",
+    )
+    request_gate_reviewers_gitlab.set_defaults(handler=cmd_request_gate_reviewers_gitlab)
     decide = subparsers.add_parser("decide", help="Record a human decision (approved/rejected/request-changes) for a lifecycle gate")
     decide.add_argument("--root", default=".")
     decide.add_argument("--task-id", required=True)
@@ -3004,6 +3203,43 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--apply", action="store_true")
     upgrade_parser.set_defaults(handler=upgrade)
+    publish_reviewer_nudge = subparsers.add_parser(
+        "publish-reviewer-nudge",
+        help=(
+            "Post or update an advisory GitHub PR comment suggesting reviewers, based on "
+            "request-gate-reviewers's classification -- never a review request, never notifies anyone"
+        ),
+    )
+    publish_reviewer_nudge.add_argument("--root", default=".")
+    publish_reviewer_nudge.add_argument("--task-id", required=True)
+    publish_reviewer_nudge.add_argument("--repo", required=True, help="GitHub repository in owner/name form")
+    publish_reviewer_nudge.add_argument("--pr", type=int, required=True, help="Pull request number; never auto-discovered")
+    publish_reviewer_nudge.add_argument(
+        "--as-bot", required=True, help="Required GitHub bot/machine login; verified via `gh api user`"
+    )
+    publish_reviewer_nudge.add_argument(
+        "--gates", default=None, help="Comma-separated gate ids, e.g. G1,G3,G9; default = all eligible gates"
+    )
+    publish_reviewer_nudge.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's run-record classification -- no default",
+    )
+    reviewer_nudge_mode = publish_reviewer_nudge.add_mutually_exclusive_group()
+    reviewer_nudge_mode.add_argument("--dry-run", dest="apply", action="store_false", help="Default: print the body and resolved action only")
+    reviewer_nudge_mode.add_argument("--apply", dest="apply", action="store_true", help="Actually create/update the comment")
+    publish_reviewer_nudge.set_defaults(apply=False)
+    publish_reviewer_nudge.add_argument("--break-lock", action="store_true", help="Explicitly override a held lock file")
+    publish_reviewer_nudge.add_argument(
+        "--i-know-this-is-mocked", action="store_true",
+        help="Required alongside --apply whenever a mock backend env var is set",
+    )
+    publish_reviewer_nudge.set_defaults(handler=cmd_publish_reviewer_nudge)
+    list_reviewer_nudge = subparsers.add_parser(
+        "list-reviewer-nudge", help="Print the reviewer-nudge sidecar ledger for a task (GitHub only, zero network)"
+    )
+    list_reviewer_nudge.add_argument("--root", default=".")
+    list_reviewer_nudge.add_argument("--task-id", required=True)
+    list_reviewer_nudge.set_defaults(handler=cmd_list_reviewer_nudge)
     for kind in ("provider", "profile", "extension"):
         group = subparsers.add_parser(kind, help=f"Inspect loaded {kind} resources")
         group.add_argument("action", choices=["list", "inspect"] if kind == "provider" else ["list"])

@@ -48,11 +48,11 @@ that both modules call into.
 
 ## Self-approval / independence
 
-`is_gate_self_approval` mirrors `gate_issues._is_self_approval`'s exact
-comparison semantics (assignee identity against every `gate["preparers"][].id`
-and `gate["independent_verifier"].id` on the run record) as a local copy,
-for the same reason as eligibility above -- a future consolidation should
-unify the two copies into one shared helper.
+`is_gate_self_approval` (comparison semantics: assignee identity against
+every `gate["preparers"][].id` and `gate["independent_verifier"].id` on the
+run record) now lives in `agentic_sdlc/__init__.py`, shared with
+`gate_issues.py` -- both modules import the same implementation rather than
+maintaining duplicate copies.
 
 ## Login-level "poisoning"
 
@@ -78,6 +78,7 @@ across; `test_gate_reviewers.py` asserts it is absent as a regression guard.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ from . import (
     authority_github_login,
     confined_path,
     fetch_github_pr_reviews,
+    is_gate_self_approval,
     load_json,
     normalize_commit_sha,
 )
@@ -169,16 +171,9 @@ def _default_gate_ids(dispatch_plan: dict[str, Any], gate_by_id: dict[str, dict[
 
 
 # --------------------------------------------------------------------------
-# Self-approval / independence (mirrors gate_issues._is_self_approval; see
-# module docstring for why this is a local copy, not a shared import)
+# Self-approval / independence: `is_gate_self_approval` is now shared via
+# `agentic_sdlc/__init__.py` (also used by `gate_issues.py`), imported above.
 # --------------------------------------------------------------------------
-
-
-def is_gate_self_approval(assignee_id: Any, gate_record: dict[str, Any]) -> bool:
-    preparers = {item.get("id") for item in gate_record.get("preparers", []) if isinstance(item, dict)}
-    verifier = gate_record.get("independent_verifier")
-    verifier_id = verifier.get("id") if isinstance(verifier, dict) else None
-    return assignee_id in preparers or (verifier_id is not None and assignee_id == verifier_id)
 
 
 # --------------------------------------------------------------------------
@@ -237,13 +232,24 @@ class PoisonCause:
 def build_plan(
     *, gate_ids: list[str], record: dict[str, Any], authorities: dict[str, Any],
     pr_author_login: str | None, as_bot_login: str,
+    resolve_login: Callable[[dict[str, Any]], str | None] = authority_github_login,
+    no_binding_reason: str = "no-github-binding",
+    author_conflict_reason: str = "pr-author-conflict",
 ) -> tuple[
     dict[str, list[Motivation]], dict[str, str], dict[str, PoisonCause], list[SkippedEntry], list[RefusalEntry],
 ]:
     """Returns `(motivations_by_login, login_display, poisoned_by_login,
     skipped, refusals)`, all keyed by lower-cased login where applicable.
     `login_display` preserves the first-seen casing of each login for
-    reporting; grouping/comparison itself is always case-insensitive."""
+    reporting; grouping/comparison itself is always case-insensitive.
+
+    Forge-agnostic by construction (eligibility, self-approval/independence,
+    and PR-wide/MR-wide poisoning are the same policy regardless of forge --
+    only *how a login/username is resolved* and *which reason codes name the
+    binding-missing / author-conflict cases* differ). `gate_reviewers_gitlab.py`
+    calls this directly with `resolve_login=authority_gitlab_username`,
+    `no_binding_reason="no-gitlab-binding"`, `author_conflict_reason="mr-author-conflict"`
+    rather than duplicating this function -- see that module's docstring."""
     gate_by_id = {g["gate_id"]: g for g in record.get("lifecycle_gates", [])}
     motivations_by_login: dict[str, list[Motivation]] = {}
     login_display: dict[str, str] = {}
@@ -300,10 +306,10 @@ def build_plan(
                 )
                 continue
 
-            login = authority_github_login(authority)
+            login = resolve_login(authority)
             if not login:
                 refusals.append(
-                    RefusalEntry(gate_id, authority_id, "no-github-binding", f"authority {authority_id} has no GitHub login binding")
+                    RefusalEntry(gate_id, authority_id, no_binding_reason, f"authority {authority_id} has no login binding")
                 )
                 continue
 
@@ -311,7 +317,7 @@ def build_plan(
             if is_gate_self_approval(authority.get("assignee"), gate_record):
                 reason = "self-approval"
             elif pr_author_login and login.lower() == pr_author_login.lower():
-                reason = "pr-author-conflict"
+                reason = author_conflict_reason
             elif as_bot_login and login.lower() == as_bot_login.lower():
                 reason = "actor-is-reviewer"
 

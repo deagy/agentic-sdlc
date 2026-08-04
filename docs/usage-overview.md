@@ -45,13 +45,19 @@ stay put.
    overlay — a manual, accountable step, not automated.
 4. **Drive the actual work**, one of two ways:
    - **Bookkeeping only** (kernel CLI): `plan` (dispatch plan), `status`,
-     `approve-from-github`/`approve-from-gitlab*` (turn a real PR
-     review/MR approval into gate-approval evidence),
-     `link-intent-from-gitlab-issue`/`link-requirements-from-gitlab-issue`
-     (attach a GitLab issue as the recorded *source* of intent/requirements
-     — separate from approval), `invalidate`/`reenter` (re-baseline a gate
-     after a material change), `validate` (exit `0` ready / `2` blocked /
-     `1` error).
+     `decide`/`approve-from-github`/`approve-from-gitlab*` (record a human
+     gate decision, or turn a real PR review/MR approval into gate-approval
+     evidence), `link-intent-from-gitlab-issue`/`link-requirements-from-gitlab-issue`
+     and their GitHub counterparts (attach a GitLab or GitHub issue as the
+     recorded *source* of intent/requirements — separate from approval),
+     `create-gate-issues`/`create-github-gate-issues` (publish tracking
+     issues for a task's gates and approvals on GitLab/GitHub),
+     `publish-gate-status` (post a read-only gate-status summary comment on
+     a PR/MR), `request-gate-reviewers`/`request-gate-reviewers-gitlab`
+     (report, never post, reviewer candidates), `publish-reviewer-nudge`
+     (post an advisory, non-notifying reviewer suggestion comment, GitHub
+     only), `invalidate`/`reenter` (re-baseline a gate after a material
+     change), `validate` (exit `0` ready / `2` blocked / `1` error).
    - **Real orchestration** (`agentic-sdlc-lg`, the LangGraph engine): `plan`
      actually dispatches author/reviewer agents per gate and runs to the
      first `interrupt()`; `resume` feeds in a human decision (or a fetched

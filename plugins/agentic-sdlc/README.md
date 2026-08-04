@@ -155,7 +155,12 @@ request-gate-reviewers  Report GitHub PR reviewer candidates for a task's lifecy
 request-gate-reviewers-gitlab  Report GitLab MR reviewer candidates for a task's lifecycle gates. Read-only / reporting only -- see "Reporting GitLab MR reviewer candidates" below.
 publish-reviewer-nudge  Post or update an advisory GitHub PR comment suggesting reviewers, based on request-gate-reviewers's classification. Never a review request, never notifies anyone -- see "Publishing an advisory reviewer nudge" below.
 list-reviewer-nudge  Print the reviewer-nudge sidecar ledger for a task (GitHub only, zero network).
+decide      Record a human decision (approved/rejected/request-changes) for a lifecycle gate, evidenced by an external URI -- the platform-agnostic counterpart to approve-from-github*/approve-from-gitlab*.
 invalidate  Record a material change and invalidate the earliest affected gate and its dependents.
+reenter     Prepare an invalidated run for explicit re-entry at a gate.
+upgrade     Check (--check) or apply (--apply) a non-destructive kernel lock upgrade.
+provider / profile / extension  Inspect loaded provider/profile/extension resources (list, or inspect for a given provider id).
+show-contract  Print a bundled lifecycle contract or schema (lifecycle-gates, mutation-gates, run-record.schema, etc.) as JSON.
 ```
 
 Always inspect command-specific help before scripting an interface:

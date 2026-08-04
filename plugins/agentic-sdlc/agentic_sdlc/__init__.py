@@ -2460,6 +2460,51 @@ def link_requirements_from_gitlab_issue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_create_gate_issues(args: argparse.Namespace) -> int:
+    """Publish gate/approval GitLab tracking issues for a task's lifecycle
+    gates (`agentic_sdlc/gate_issues.py`). Strictly orthogonal to the
+    approval adapters above -- this never touches human_approvals,
+    gate.status, evidence_refs, or disposition; see gate_issues.py's module
+    docstring."""
+    from . import gate_issues  # local import: see gate_issues.py's own docstring for why
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    gates = [item.strip() for item in args.gates.split(",") if item.strip()] if args.gates else None
+    try:
+        result = gate_issues.run(
+            root=root,
+            task_id=task_id,
+            project_path=args.project_path,
+            as_bot=args.as_bot,
+            gates=gates,
+            apply=args.apply,
+            plan_digest=args.plan_digest,
+            allow_classification=args.allow_classification,
+            link_type=args.link_type,
+            include_scope=args.include_scope,
+            reconcile_assignees=args.reconcile_assignees,
+            break_lock=args.break_lock,
+            i_know_this_is_mocked=args.i_know_this_is_mocked,
+        )
+    except gate_issues.GateIssuesBlocked as error:
+        print(json.dumps({"error": str(error)}, indent=2), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
+    if result.get("refusals") or result.get("drift_detected"):
+        return 2
+    return 0
+
+
+def cmd_list_gate_issues(args: argparse.Namespace) -> int:
+    from . import gate_issues  # local import: see gate_issues.py's own docstring for why
+
+    root = Path(args.root).resolve()
+    task_id = safe_task_id(args.task_id)
+    print(json.dumps(gate_issues.read_ledger(root, task_id), indent=2))
+    return 0
+
+
 def provider_introspection(args: argparse.Namespace) -> int:
     if args.resource_kind == "provider":
         if args.action == "list":
@@ -2571,6 +2616,48 @@ def build_parser() -> argparse.ArgumentParser:
     link_requirements.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
     link_requirements.add_argument("--issue-iid", type=int, required=True, help="Issue internal ID (iid)")
     link_requirements.set_defaults(handler=link_requirements_from_gitlab_issue)
+    create_gate_issues = subparsers.add_parser(
+        "create-gate-issues", help="Publish GitLab gate/approval tracking issues for a task's lifecycle gates"
+    )
+    create_gate_issues.add_argument("--root", default=".")
+    create_gate_issues.add_argument("--task-id", required=True)
+    create_gate_issues.add_argument("--project-path", required=True, help="GitLab project path (namespace/project)")
+    create_gate_issues.add_argument(
+        "--as-bot", required=True, help="Required GitLab bot/machine username; verified via `glab api user`"
+    )
+    create_gate_issues.add_argument(
+        "--gates", default=None, help="Comma-separated gate ids, e.g. G1,G3,G9; default = all eligible gates"
+    )
+    gate_issues_mode = create_gate_issues.add_mutually_exclusive_group()
+    gate_issues_mode.add_argument("--dry-run", dest="apply", action="store_false", help="Default: print the plan digest only")
+    gate_issues_mode.add_argument("--apply", dest="apply", action="store_true", help="Actually create/reuse issues")
+    create_gate_issues.set_defaults(apply=False)
+    create_gate_issues.add_argument("--plan-digest", default=None, help="Required with --apply (from a prior --dry-run)")
+    create_gate_issues.add_argument(
+        "--allow-classification", default=None,
+        help="Must exactly match the task's run-record classification -- no default",
+    )
+    create_gate_issues.add_argument(
+        "--link-type", choices=["relates_to"], default=None,
+        help="Opt-in: also call the GitLab Issue Links API; fails closed (exit 2) if unavailable",
+    )
+    create_gate_issues.add_argument(
+        "--include-scope", action="store_true", help="Add a sanitized scope line to gate issue descriptions (default off)"
+    )
+    create_gate_issues.add_argument(
+        "--reconcile-assignees", action="store_true",
+        help="Overwrite GitLab's assignee to match authorities.json on drift (default: report only)",
+    )
+    create_gate_issues.add_argument("--break-lock", action="store_true", help="Explicitly override a held lock file")
+    create_gate_issues.add_argument(
+        "--i-know-this-is-mocked", action="store_true",
+        help="Required alongside --apply whenever AGENTIC_SDLC_TEST_ISSUE_CREATE_FILE is set",
+    )
+    create_gate_issues.set_defaults(handler=cmd_create_gate_issues)
+    list_gate_issues = subparsers.add_parser("list-gate-issues", help="Print the gate-issues sidecar ledger for a task")
+    list_gate_issues.add_argument("--root", default=".")
+    list_gate_issues.add_argument("--task-id", required=True)
+    list_gate_issues.set_defaults(handler=cmd_list_gate_issues)
     decide = subparsers.add_parser("decide", help="Record a human decision (approved/rejected/request-changes) for a lifecycle gate")
     decide.add_argument("--root", default=".")
     decide.add_argument("--task-id", required=True)

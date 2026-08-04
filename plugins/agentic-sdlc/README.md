@@ -143,6 +143,8 @@ approve-from-gitlab  Record a human lifecycle approval from a GitLab MR approval
 approve-from-gitlab-mr  Fetch an approved GitLab MR approval and record it as lifecycle approval evidence. Speculative: not the approval source this kernel's own default provider uses (see "Current limitations").
 link-intent-from-gitlab-issue  Link a GitLab issue as the recorded source for G1 Intent.
 link-requirements-from-gitlab-issue  Link a GitLab issue as the recorded source for G2 Requirements Baseline.
+create-gate-issues  Publish GitLab gate/approval tracking issues for a task's lifecycle gates.
+list-gate-issues   Print the gate-issues sidecar ledger for a task.
 invalidate  Record a material change and invalidate the earliest affected gate and its dependents.
 ```
 
@@ -203,6 +205,20 @@ Each command fetches the issue via `glab api projects/<project>/issues/<iid>`, r
 **This is deliberately not approval evidence.** Linking a GitLab issue never marks G1/G2 approved, and gate approval (`approve-from-github`/`approve-from-gitlab*` above, or the LangGraph engine's `human_approval_{gate}` interrupt) is completely unaffected by whether a source is linked — the two are orthogonal by design. Authorization still requires the caller's `--role` to be an assigned, applicable authority for the target gate (the same discipline the approval adapters use), so only accountable humans can attach a source, but attaching one is not itself a sign-off.
 
 Unlike the approval adapters, no per-person identity is ever fetched or persisted here — an issue link has no "approver" concept, so there is nothing to data-minimize away. Only the issue's `iid`, `title`, `state`, and `web_url` are used.
+
+### Publishing GitLab gate/approval tracking issues
+
+`create-gate-issues` backs a task's lifecycle gates with real GitLab issues, idempotently: one **gate tracking issue** per applicable, in-sequence lifecycle gate, plus one **approval issue** per applicable `authority_requirements[]` entry, assigned to the resolved GitLab username (`authority_gitlab_username()` — same identity binding `approve-from-gitlab-mr` uses). GitLab itself (queried by a deterministic, non-sensitive label pair) is the source of truth for "does this issue already exist"; a local sidecar ledger (`.agentic-sdlc/runs/<task-id>/gate-issues.json`) is diagnostics only and is never trusted over a fresh label search. This is strictly outbound-only and orthogonal to the approval adapters above: it never writes `human_approvals`, `gate.status`, `evidence_refs`, or `disposition` — closing a tracking issue on GitLab is never approval evidence.
+
+Each approval issue's description carries a module-emitted `> parent <group/project>#<gate_iid>` cross-reference line, which GitLab auto-renders as a working bidirectional link with no API-tier requirement. `--link-type relates_to` additionally calls the GitLab Issue Links API as an opt-in enhancement; if that API is unavailable on the target instance, the whole run aborts (never silently falls back to the description-only link).
+
+The command is two-phase, mirroring the plan-digest pattern used elsewhere in this kernel: a `--dry-run` (the default) computes and prints a `plan_digest` with no GitLab calls; `--apply` requires that exact `--plan-digest` (recomputed and re-checked before every issue, so a concurrent `authorities.json`/run-record change aborts cleanly rather than silently changing behavior mid-run). An authority requirement that cannot be resolved to a real, non-self-approving GitLab assignee (missing authority, unassigned, no GitLab username binding, username resolves to zero or multiple active GitLab users, or the resolved assignee is a preparer/independent verifier of that gate) is refused individually — the run continues creating everything else it can, but exits 2 and reports every refusal by reason code. GitLab assignee drift on a reused approval issue is reported (exit 2), never silently overwritten, unless `--reconcile-assignees` is passed.
+
+```sh
+agentic-sdlc create-gate-issues --root /path/to/target --task-id TEAM-DEMO-001 --project-path group/project --as-bot svc-agentic-sdlc --allow-classification internal --dry-run
+agentic-sdlc create-gate-issues --root /path/to/target --task-id TEAM-DEMO-001 --project-path group/project --as-bot svc-agentic-sdlc --allow-classification internal --apply --plan-digest sha256:...
+agentic-sdlc list-gate-issues --root /path/to/target --task-id TEAM-DEMO-001
+```
 
 `validate` exits with `0` when valid and ready, `2` when structurally valid but blocked by unresolved decisions, and `1` for errors. Treat both `1` and `2` as non-ready in CI.
 

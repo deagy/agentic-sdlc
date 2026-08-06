@@ -175,16 +175,16 @@ def test_dependency_version_ranges_are_enforced(tmp_path):
     with pytest.raises(ValueError, match="incompatible with kernel"):
         load_provider(boundary_excluded)
 
-    # Real fixture's range (0.3.0 <= kernel < 0.4.0) -> accepted.
+    # Real fixture's range (0.3.0 <= kernel < 1.0.0) -> accepted.
     in_range = write_manifest(
-        kernel_compatibility={"minimum": "0.3.0", "maximum_exclusive": "0.4.0"}
+        kernel_compatibility={"minimum": "0.3.0", "maximum_exclusive": "1.0.0"}
     )
     loaded = load_provider(in_range)
     assert loaded.id == "range-provider"
 
     # A declared dependency that isn't in `already_loaded` -> rejected.
     with_dependency = write_manifest(
-        kernel_compatibility={"minimum": "0.3.0", "maximum_exclusive": "0.4.0"},
+        kernel_compatibility={"minimum": "0.3.0", "maximum_exclusive": "1.0.0"},
         dependencies=[{"id": "some-other-provider", "version": "1.0.0"}],
     )
     with pytest.raises(ValueError, match="requires provider some-other-provider to be loaded first"):

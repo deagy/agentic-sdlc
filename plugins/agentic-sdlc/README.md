@@ -105,12 +105,24 @@ agent catalog, and optional extensions through a versioned manifest:
   "version": "0.3.0",
   "kernel_compatibility": {
     "minimum": "0.3.0",
-    "maximum_exclusive": "0.4.0"
+    "maximum_exclusive": "1.0.0"
   },
   "agent_catalog": "agent-catalog.json",
   "profile_roots": ["profiles"],
   "extension_roots": ["extensions"]
 }
+```
+
+Keep `kernel_compatibility` a deliberately wide, honest range rather than
+pinning tightly to whatever the kernel's `VERSION` happens to read today.
+`VERSION` (`agentic_sdlc/__init__.py`) is bumped by hand on every tagged
+release with nothing enforcing it stays in sync with the actual tag — it
+drifted for 9 releases (v0.4.0 through v0.12.0) before being caught, which
+silently made every provider pinning a narrow range (like this manifest's
+own former `[0.3.0, 0.4.0)`) reject perfectly compatible newer kernel
+releases. A pre-1.0 provider that only relies on backward-compatible
+additions should express that as `[<oldest tested>, 1.0.0)`, not
+`[<oldest tested>, <oldest tested's next minor>)`.
 ```
 
 (Illustrative shape, based on `providers/agentic-sdlc-defaults/provider.json`, the reference provider this repository ships — that file's own `extension_roots`/`dependencies` differ slightly since it declares no extensions. Any external provider, such as the one `deagy/agents` supplies, follows the same manifest shape with its own `id`.)

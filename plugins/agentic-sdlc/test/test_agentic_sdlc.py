@@ -74,7 +74,7 @@ class V03MigrationTests(unittest.TestCase):
         self.assertEqual([], second["created"])
         self.assertEqual("preserve", self.load(".agentic-sdlc/project.json")["human_note"])
         lock = self.load(".agentic-sdlc/version.lock")
-        self.assertEqual("0.3.0", lock["kernel_version"])
+        self.assertEqual(agentic_sdlc.VERSION, lock["kernel_version"])
         self.assertTrue(lock["contract_digest"].startswith("sha256:"))
         self.assertEqual([], self.run_cli("provider", "list"))
 
@@ -96,7 +96,7 @@ class V03MigrationTests(unittest.TestCase):
         self.assertEqual(["cloud-architect"], gate["agents"])
         self.assertEqual(["define-architecture"], gate["tasks"])
         record = self.load(".agentic-sdlc/runs/MIGRATE-1/run-record.json")
-        self.assertEqual("0.3.0", record["kernel_version"])
+        self.assertEqual(agentic_sdlc.VERSION, record["kernel_version"])
         self.assertTrue(record["dispatch_binding_digest"].startswith("sha256:"))
         self.assertEqual("agentic-sdlc-defaults", record["provider_bindings"][0]["id"])
 
@@ -138,7 +138,7 @@ class V03MigrationTests(unittest.TestCase):
         applied = self.run_cli("upgrade", "--apply")
         self.assertTrue(applied["mutation"])
         self.assertEqual("keep", self.load(".agentic-sdlc/project.json")["decision"])
-        self.assertEqual("0.3.0", self.load(".agentic-sdlc/version.lock")["kernel_version"])
+        self.assertEqual(agentic_sdlc.VERSION, self.load(".agentic-sdlc/version.lock")["kernel_version"])
 
     def test_invalidation_and_reentry_preserve_history_but_clear_stale_bindings(self):
         self.run_cli("init", "--profile", "generic", provider=True)

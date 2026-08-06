@@ -21,10 +21,15 @@ version would do only for a *single* process's one-shot accumulation, not
 some ambient global truth.
 
 `KERNEL_VERSION` mirrors the legacy script's own `VERSION` constant
-(agentic_sdlc.py ~19) -- the "kernel" a provider's `kernel_compatibility`
-range is checked against. The real `providers/agentic-sdlc-defaults`
-fixture declares `{"minimum": "0.3.0", "maximum_exclusive": "0.4.0"}`,
-so this is pinned to `"0.3.0"` to keep that fixture loadable.
+(agentic_sdlc.py ~21) -- the "kernel" a provider's `kernel_compatibility`
+range is checked against. Keep it equal to that constant by hand; nothing
+enforces the two stay in sync automatically. They drifted once already
+(`agentic_sdlc.py`'s `VERSION` stayed "0.3.0" through 9 tagged releases
+that actually shipped new functionality -- see that constant's own
+comment) without this mirror ever being touched, which happened not to
+break this module's own tests only because they hardcode a `[0.3.0, 0.4.0)`
+range that matched the stale value by coincidence, not because anything
+here would have caught real drift.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-KERNEL_VERSION = "0.3.0"
+KERNEL_VERSION = "0.13.0"
 
 _VALID_AGENT_KINDS = {"author", "reviewer", "specialist"}
 _VALID_AGENT_CAPABILITIES = {"author", "reviewer", "dispatch"}

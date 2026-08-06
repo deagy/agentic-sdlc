@@ -18,7 +18,20 @@ from typing import Any
 from urllib.parse import quote
 
 
-VERSION = "0.3.0"
+
+# Bump this on every tagged release (`git tag vX.Y.Z`); nothing else in this
+# repo does it automatically. It drifted badly once already: v0.4.0 through
+# v0.12.0 (9 tagged releases, 2026-07-25 through 2026-08-04, adding `decide`,
+# GitLab/GitHub gate-tracking issues, gate-status publishing, and reviewer
+# reporting/nudging) all shipped with this constant still reading "0.3.0"
+# from the v0.3.0 tag. That silently broke every consumer pinning a provider
+# manifest's `kernel_compatibility` range against this value (see
+# `deagy/cadre-lifecycle`'s `provider.json`, which requested exactly
+# `[0.3.0, 0.4.0)` and therefore could only ever resolve the original,
+# feature-incomplete v0.3.0 tag no matter which later tag a consumer's
+# bootstrap script actually installed from) -- verify this string matches
+# the tag being cut before pushing it.
+VERSION = "0.13.0"
 
 # Packaged as the `agentic-sdlc` pip/pipx-installable distribution (see
 # plugins/agentic-sdlc/pyproject.toml); contracts/ is bundled as package data
@@ -195,10 +208,16 @@ def load_provider(manifest_path: str) -> None:
     compatibility = manifest.get("kernel_compatibility")
     if not isinstance(compatibility, dict):
         raise ValueError(f"provider {provider_id} is missing kernel_compatibility")
-    minimum = semver_tuple(str(compatibility.get("minimum")))
-    maximum = semver_tuple(str(compatibility.get("maximum_exclusive")))
+    minimum_str = str(compatibility.get("minimum"))
+    maximum_str = str(compatibility.get("maximum_exclusive"))
+    minimum = semver_tuple(minimum_str)
+    maximum = semver_tuple(maximum_str)
     if not minimum <= semver_tuple(VERSION) < maximum:
-        raise ValueError(f"provider {provider_id} version {provider_version} is incompatible with kernel {VERSION}; install a provider compatible with 0.3.x")
+        raise ValueError(
+            f"provider {provider_id} declares kernel_compatibility [{minimum_str}, {maximum_str}), "
+            f"which does not include this kernel's version {VERSION}; install a provider compatible "
+            f"with kernel {VERSION}, or a kernel version within the provider's declared range"
+        )
     for dependency in manifest.get("dependencies", []):
         if not isinstance(dependency, dict) or not isinstance(dependency.get("id"), str):
             raise ValueError(f"provider {provider_id} has malformed dependency metadata")

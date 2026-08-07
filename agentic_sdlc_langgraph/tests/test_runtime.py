@@ -168,20 +168,60 @@ def test_default_model_client_is_fake_when_env_var_set(monkeypatch: pytest.Monke
     assert isinstance(runtime.default_model_client(), FakeModelClient)
 
 
-def test_default_model_client_is_anthropic_when_env_var_unset(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
-    monkeypatch.delenv(runtime.MODEL_PROVIDER_ENV_VAR, raising=False)
+def _clear_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        runtime.FAKE_MODEL_ENV_VAR,
+        runtime.MODEL_PROVIDER_ENV_VAR,
+        runtime.OPENAI_MODEL_ENV_VAR,
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_default_model_client_raises_when_no_provider_configured(monkeypatch: pytest.MonkeyPatch):
+    # Anthropic is not an implicit default: with neither MODEL_PROVIDER_ENV_VAR
+    # nor any provider credential set, dispatch must fail fast with an
+    # actionable error rather than silently assuming Anthropic and only
+    # failing later, inside the SDK, once a gate actually dispatches.
+    _clear_provider_env(monkeypatch)
+    with pytest.raises(runtime.GraphConfigError, match="no model provider configured"):
+        runtime.default_model_client()
+
+
+def test_default_model_client_autodetects_anthropic_from_api_key(monkeypatch: pytest.MonkeyPatch):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     assert isinstance(runtime.default_model_client(), AnthropicModelClient)
 
 
+def test_default_model_client_autodetects_openai_from_api_key(monkeypatch: pytest.MonkeyPatch):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv(runtime.OPENAI_MODEL_ENV_VAR, "gpt-4o-mini")
+    client = runtime.default_model_client()
+    assert isinstance(client, OpenAICompatibleModelClient)
+    assert client.model == "gpt-4o-mini"
+
+
+def test_default_model_client_raises_when_both_credentials_present(monkeypatch: pytest.MonkeyPatch):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv(runtime.OPENAI_MODEL_ENV_VAR, "gpt-4o-mini")
+    with pytest.raises(runtime.GraphConfigError, match="set .*MODEL_PROVIDER"):
+        runtime.default_model_client()
+
+
 def test_default_model_client_is_anthropic_when_provider_explicit(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    _clear_provider_env(monkeypatch)
     monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "anthropic")
     assert isinstance(runtime.default_model_client(), AnthropicModelClient)
 
 
 def test_default_model_client_is_openai_when_provider_set(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    _clear_provider_env(monkeypatch)
     monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
     monkeypatch.setenv(runtime.OPENAI_MODEL_ENV_VAR, "gpt-4o-mini")
     client = runtime.default_model_client()
@@ -190,15 +230,14 @@ def test_default_model_client_is_openai_when_provider_set(monkeypatch: pytest.Mo
 
 
 def test_default_model_client_openai_requires_model_env_var(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    _clear_provider_env(monkeypatch)
     monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "openai")
-    monkeypatch.delenv(runtime.OPENAI_MODEL_ENV_VAR, raising=False)
     with pytest.raises(runtime.GraphConfigError):
         runtime.default_model_client()
 
 
 def test_default_model_client_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv(runtime.FAKE_MODEL_ENV_VAR, raising=False)
+    _clear_provider_env(monkeypatch)
     monkeypatch.setenv(runtime.MODEL_PROVIDER_ENV_VAR, "bogus")
     with pytest.raises(runtime.GraphConfigError):
         runtime.default_model_client()

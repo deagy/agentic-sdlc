@@ -30,12 +30,23 @@ use a deterministic `FakeModelClient`. Set
 `AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL=1` to make the CLI/service use it too
 (no network calls), instead of a real model-backed client. Otherwise,
 `AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` selects which real client:
-`anthropic` (default) uses `AnthropicModelClient`; `openai` uses
+`anthropic` uses `AnthropicModelClient`; `openai` uses
 `OpenAICompatibleModelClient` against any OpenAI-compatible
-chat-completions server (OpenAI itself, or a self-hosted/third-party
-server mirroring its API shape — vLLM, Ollama, Azure OpenAI, LiteLLM,
-etc, via `OPENAI_BASE_URL`), and requires
+chat-completions server (OpenAI itself — including Codex's own backend —
+or a self-hosted/third-party server mirroring its API shape: vLLM,
+Ollama, Azure OpenAI, LiteLLM, etc, via `OPENAI_BASE_URL`), and requires
 `AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL` to name the model to call.
+Anthropic is one option, not a requirement: if
+`AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` is left unset, the provider is
+auto-detected from whichever credential is actually present
+(`ANTHROPIC_API_KEY` vs. `OPENAI_API_KEY`/`OPENAI_BASE_URL`/
+`AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL`); with neither (or both) present,
+dispatch fails fast at graph-build time with an actionable error instead
+of only failing once a gate actually dispatches and hits a missing key
+deep in the SDK. An external CLI agent (Codex CLI or anything else) can
+also be wired in per-agent via the agent catalog's `transport: "a2a"` +
+`endpoint`, independent of this provider selection — see
+`agents.A2AModelClient`/`DispatchingModelClient`.
 
 ## CLI
 

@@ -81,14 +81,29 @@ to reconstruct the graph shape, nothing about live gate status.
 
 - **Model provider** (`AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` environment
   variable, checked only when the fake-model switch above is not active):
-  `"anthropic"` (the default, preserving prior behavior) selects
-  `AnthropicModelClient`; `"openai"` selects `OpenAICompatibleModelClient`,
-  reading its required `model` from `AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL`
-  (`OpenAICompatibleModelClient` itself reads `OPENAI_API_KEY`/
-  `OPENAI_BASE_URL`, so those aren't duplicated here) -- this is what lets
-  the engine target any OpenAI-compatible chat-completions server (OpenAI
-  itself, or a self-hosted/third-party server mirroring its API shape)
-  instead of Anthropic.
+  `"anthropic"` selects `AnthropicModelClient`; `"openai"` selects
+  `OpenAICompatibleModelClient`, reading its required `model` from
+  `AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL` (`OpenAICompatibleModelClient`
+  itself reads `OPENAI_API_KEY`/`OPENAI_BASE_URL`, so those aren't
+  duplicated here) -- this is what lets the engine target any
+  OpenAI-compatible chat-completions server (OpenAI itself, Codex's own
+  backend, or a self-hosted/third-party server mirroring that API shape:
+  vLLM, Ollama, Azure OpenAI, LiteLLM proxies, etc) instead of Anthropic.
+
+  Anthropic is *not* assumed when this variable is unset -- an
+  unconfigured deployment has no default provider to silently fall back
+  to (that previously meant dispatch always tried Anthropic and only
+  failed, deep in the SDK, once a gate actually dispatched and no
+  `ANTHROPIC_API_KEY` was set). Instead, when unset, `default_model_client()`
+  auto-detects from whichever credential is actually present
+  (`ANTHROPIC_API_KEY` vs. `OPENAI_API_KEY`/`OPENAI_BASE_URL`/
+  `AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL`); if both or neither are present,
+  it raises `GraphConfigError` immediately, at graph-build time, with an
+  actionable message -- not a network call away, inside a dispatched
+  gate. An external CLI agent (Codex CLI, or anything else) can also be
+  wired in per-agent via the agent catalog's `transport: "a2a"` +
+  `endpoint`, independent of this provider selection -- see
+  `agents.A2AModelClient`/`DispatchingModelClient`.
 """
 
 from __future__ import annotations
@@ -140,7 +155,9 @@ FAKE_MODEL_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL"
 
 # See module docstring: selects which real model-backed client
 # `default_model_client()` builds when the fake-model switch above isn't
-# active. Defaults to "anthropic" so existing deployments are unaffected.
+# active. When unset, the provider is auto-detected from whichever
+# credential is present rather than assumed to be "anthropic" -- see
+# `_detect_model_provider()`.
 MODEL_PROVIDER_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER"
 OPENAI_MODEL_ENV_VAR = "AGENTIC_SDLC_LANGGRAPH_OPENAI_MODEL"
 
@@ -190,14 +207,52 @@ def task_exists(root: str | Path, task_id: str) -> bool:
     return _graph_config_path(Path(root).resolve(), task_id).is_file()
 
 
+def _detect_model_provider() -> str:
+    """Auto-detect which provider to use when `MODEL_PROVIDER_ENV_VAR` is
+    unset, from whichever credential is actually present. Anthropic is
+    deliberately not a fallback default: with neither credential (or
+    both, ambiguously) present, this raises `GraphConfigError` rather
+    than guessing -- see `default_model_client`'s docstring.
+    """
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_openai = bool(
+        os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get(OPENAI_MODEL_ENV_VAR)
+    )
+    if has_anthropic and not has_openai:
+        return "anthropic"
+    if has_openai and not has_anthropic:
+        return "openai"
+    if has_anthropic and has_openai:
+        raise GraphConfigError(
+            "both ANTHROPIC_API_KEY and an OpenAI-compatible credential "
+            f"(OPENAI_API_KEY/OPENAI_BASE_URL/{OPENAI_MODEL_ENV_VAR}) are configured -- "
+            f"set {MODEL_PROVIDER_ENV_VAR}=anthropic or {MODEL_PROVIDER_ENV_VAR}=openai "
+            "to disambiguate which one dispatch should use."
+        )
+    raise GraphConfigError(
+        "no model provider configured for agent dispatch. Set one of: "
+        f"{MODEL_PROVIDER_ENV_VAR}=anthropic (+ ANTHROPIC_API_KEY); "
+        f"{MODEL_PROVIDER_ENV_VAR}=openai (+ OPENAI_API_KEY or OPENAI_BASE_URL, "
+        f"+ {OPENAI_MODEL_ENV_VAR}) -- this is also the path for Codex CLI or any other "
+        "OpenAI-compatible endpoint; or "
+        f"{FAKE_MODEL_ENV_VAR}=1 for a network-free dry run. An external CLI agent can "
+        "also be dispatched per-agent via the agent catalog's transport: \"a2a\" + "
+        "endpoint, independent of this provider selection."
+    )
+
+
 def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelClient:
     """Resolve the default `ModelClient` for `build_graph_for_task`.
 
     Returns a `FakeModelClient` (deterministic, no network) when the
     `AGENTIC_SDLC_LANGGRAPH_FAKE_MODEL` environment variable is set to
     `"1"`; otherwise a real model-backed client chosen by
-    `AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` (`"anthropic"`, the default, or
-    `"openai"`). See module docstring.
+    `AGENTIC_SDLC_LANGGRAPH_MODEL_PROVIDER` (`"anthropic"` or `"openai"`),
+    or, when that's unset, auto-detected from whichever credential is
+    present (`_detect_model_provider`). Anthropic is one option among
+    others, never an implicit requirement -- see module docstring.
 
     If `agent_catalog` has any entry with `transport: "a2a"`, the
     resolved client is wrapped in a `DispatchingModelClient` so those
@@ -208,7 +263,7 @@ def default_model_client(agent_catalog: dict[str, Any] | None = None) -> ModelCl
     if os.environ.get(FAKE_MODEL_ENV_VAR) == "1":
         base: ModelClient = FakeModelClient()
     else:
-        provider = os.environ.get(MODEL_PROVIDER_ENV_VAR, "anthropic")
+        provider = os.environ.get(MODEL_PROVIDER_ENV_VAR) or _detect_model_provider()
         if provider == "openai":
             openai_model = os.environ.get(OPENAI_MODEL_ENV_VAR)
             if not openai_model:

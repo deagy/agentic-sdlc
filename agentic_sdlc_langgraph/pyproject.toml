@@ -1,6 +1,6 @@
 [project]
 name = "agentic-sdlc-langgraph"
-version = "0.1.0"
+version = "0.3.0"
 description = "LangGraph-based execution engine for the Agentic SDLC G1-G10 lifecycle (Phase 0 spike: G1-G3)."
 requires-python = ">=3.11"
 dependencies = [

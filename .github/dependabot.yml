@@ -1,0 +1,54 @@
+
+# Dependabot configuration for deagy/agentic-sdlc
+#
+# Automated dependency updates for Python dependencies across both the
+# kernel (plugins/agentic-sdlc/) and LangGraph engine (agentic_sdlc_langgraph/).
+# See: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  # Kernel dependencies (plugins/agentic-sdlc/)
+  - package-ecosystem: "pip"
+    directory: "/plugins/agentic-sdlc"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps:kernel"
+    labels:
+      - "dependencies"
+      - "python"
+      - "kernel"
+
+  # LangGraph engine dependencies (agentic_sdlc_langgraph/)
+  - package-ecosystem: "pip"
+    directory: "/agentic_sdlc_langgraph"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps:engine"
+    labels:
+      - "dependencies"
+      - "python"
+      - "engine"
+
+  # GitHub Actions workflow dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "ci"

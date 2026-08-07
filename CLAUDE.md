@@ -71,3 +71,10 @@ Several LangGraph engine modules (`contracts.py`, `provider.py`, `planning.py`, 
 
 ## Working across the two subsystems
 Changes to gate semantics, contract shape, or provider/profile schema belong in `plugins/agentic-sdlc/contracts/` and must be reflected in the LangGraph engine's `contracts.py` loaders (and vice versa — the engine ports specific kernel functions, so kernel changes can silently desync the port). Run both test suites before considering cross-cutting work done (see AGENTS.md).
+
+## Related repositories
+
+- [**cadre**](https://github.com/deagy/cadre) — The Agent Suite. Canonical source for 71 role definitions, `roster/catalog.yaml`, orchestration routing, and the `provider/` bundle consumed by this repository's provider ecosystem. See its [CLAUDE.md](https://github.com/deagy/cadre/blob/main/CLAUDE.md) for role catalog architecture.
+- [**cadre-lifecycle**](https://github.com/deagy/cadre-lifecycle) — The Plugin Distribution. Packages role definitions, lifecycle skills, and Agentic SDLC plugins from this repository into installable Claude Code / Codex plugins. See its [CLAUDE.md](https://github.com/deagy/cadre-lifecycle/blob/main/CLAUDE.md) for plugin architecture notes.
+
+This repository owns the lifecycle kernel and engine; role catalog content lives in cadre, and the plugin packaging lives in cadre-lifecycle.

@@ -44,3 +44,14 @@ commit history for the phase-by-phase design rationale.
 ```sh
 cd agentic_sdlc_langgraph && uv sync && uv run pytest
 ```
+
+## Examples
+
+See [docs/examples/](docs/examples/) for end-to-end workflow documentation:
+
+- [Full lifecycle workflow](docs/examples/full-lifecycle.md) — from G1 intent through G10 post-release review
+
+Additional documentation:
+
+- [docs/gate-rationale.md](docs/gate-rationale.md) — why these ten gates (and not eight or twelve)
+- [docs/usage-overview.md](docs/usage-overview.md) — high-level usage guide

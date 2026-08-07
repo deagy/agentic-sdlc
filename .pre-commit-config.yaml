@@ -1,0 +1,48 @@
+# Pre-commit hooks for deagy/agentic-sdlc
+#
+# Python linting, test execution, and contract consistency checks.
+# See: https://pre-commit.com/
+
+repos:
+  # Python quality checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-json
+        files: "contracts/"
+      - id: end-of-file-fixer
+        files: "\\.md$|\\.py$"
+      - id: trailing-whitespace
+        files: "\\.md$|\\.py$"
+
+  # Kernel + LangGraph test execution
+  - repo: local
+    hooks:
+      - id: kernel-tests
+        name: Run kernel test suite
+        entry: python3 -B -m unittest discover -s plugins/agentic-sdlc/test -p "test_*.py"
+        language: python
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: langgraph-tests
+        name: Run LangGraph engine tests
+        entry: bash -c "cd agentic_sdlc_langgraph && uv run pytest"
+        language: python
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: contract-schema-check
+        name: Validate lifecycle contract schemas
+        entry: >
+          bash -c '
+            for schema in plugins/agentic-sdlc/contracts/*.schema.json; do
+              python3 -c "import json; json.load(open(\"$schema\"))" || exit 1;
+            done
+          '
+        language: python
+        pass_filenames: false
+        files: "contracts/.*\\.schema\\.json$"
